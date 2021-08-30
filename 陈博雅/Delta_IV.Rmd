@@ -1,0 +1,422 @@
+---
+title: "Delta_IV"
+---
+
+```{r message=FALSE, warning=FALSE}
+library(dplyr)
+library(data.table)
+library(tibble)
+library(tidyr)
+library(arrow)
+library(purrr)
+library(ggplot2)
+library(ggpubr)
+library(fOptions)
+# source("Delta_IV_Functions.R")
+```
+
+## 需要手动输入的
+```{r 需要手动输入的信息}
+read_path = "/Users/cindy/Desktop/Intern/Data/202104PRim"
+wtPath = "/Users/cindy/Desktop/Intern/Data/04DeltaVol/"
+etftype = 510050
+
+# 勿改, sql用
+shIze = paste(etftype %>% as.character(), ".SH", sep ="")
+```
+
+## Setup
+```{r}
+library(DBI)
+con <- DBI::dbConnect(odbc::odbc(), Driver = "ODBC Driver 17 for SQL Server", 
+    Server = "192.168.9.85", Database = "Option", UID = "sa", 
+    PWD = "lhtzb.123", Port = 1433)
+
+```
+
+
+```{r Data Risk import}
+## Read Risk Data
+rf = dbReadTable(con, Id(schema = "dbo", name = "rf"))
+colnames(rf) = c("date", "risk")
+rf$date = as.Date(rf$date, format = "%Y-%m-%d")
+rf$risk = log( 1 + (rf$risk / 100))
+```
+
+```{sql Contract Info, connection = con, output.var = cdi}
+select "日期", "期权代码","交易代码","行权价","前结算价","收盘价","结算价","认购认沽","上市日","到期日"
+from contract_info_daily
+where "期权标的" = ?shIze
+```
+
+```{r cdi Processing}
+colnames(cdi) = c("date", "symbol", "trading_code", "strike_prc", "prev_setl_prc", "close",
+                  "setl.prc","callput", "effective_date", "expire_date")
+cdi = cdi %>%  
+  mutate(callput = ifelse(callput == "认购", "c", "p"))
+
+```
+
+## Functions
+```{r Functions}
+## Function Imported from Vix_Funcions.R 有微调
+
+# Read Minbar Data，一天整天的数据合并为一个dataframe
+# path: {character} path to the data, we want to import, assume data is minbar data from datahouse
+# return: {dataframe} dataframe with selected data -- see col_select
+readOne = function(path){
+  od = list.files(path, recursive = TRUE,full.names = TRUE, pattern = "^sh_1000") %>%
+    lapply(function(f)
+      read_parquet(f, col_select = c("symbol","datetime", "close", "volume",
+                                     "first_ask_prc1", "first_ask_vol1", "first_ask_vol2",
+                                     "first_ask_vol3", "first_ask_vol4", "first_ask_vol5",
+                                     "first_bid_prc1", "first_bid_vol1", "first_bid_vol2",
+                                     "first_bid_vol3", "first_bid_vol4", "first_bid_vol5"))) %>%
+    rbindlist(use.names = TRUE) %>%
+    arrange(datetime) %>% 
+    mutate(symbol = as.numeric(substr(symbol, 1, 8)))
+  
+  return(od)
+}
+
+# 读取 etf50的分钟价格
+# Path: {character} path to the folder that contain the minbar etf price file 
+#       file name start with either "sh_510050" or "sh_510300"
+# type: {numeric} either 510050 or 510300, to identify etf type
+# return: {dataframe} with columns datetime, stock_prc
+readStkPrc = function(path, type){
+  pat = paste("^sh_", type, sep = "")
+  path = list.files(path, recursive = TRUE, full.names = TRUE, pattern = pat)
+  df = read_parquet(path, col_select = c("datetime", "open"))
+  colnames(df) = c("datetime", "stock_prc")
+  return(df)
+}
+
+# Combine Minbar Data & contract daily info to extract and process
+# relavent info such as strike price, expire_mins etc
+# od: {dataframe} readOne 的读取结果
+# cdi: {dataframe} daily contract info pulled from sql database
+PrepareDf = function(od, cdi){
+  od$datetime = as.POSIXct(od$datetime, tz = "UTC")
+  cdiOD = cdi %>%  subset(as.Date(cdi$date) %in% unique(as.Date(od$datetime)))
+  
+  od = od %>% mutate(date = as.Date(datetime))
+  cdiOD$date =  as.Date(cdiOD$date)
+  
+  test = merge(od, cdiOD, by= c("date","symbol"), all.x = TRUE, all.y = FALSE) %>% rowwise() %>% 
+    mutate(close.x = ifelse(is.na(close.x), prev_setl_prc, close.x)) %>% 
+    group_by(symbol) %>%
+    mutate(pre_close_prc = c(head(prev_setl_prc,1), head(close.x, -1))) %>% ungroup() %>% 
+    select(-c(date, close.x, prev_setl_prc)) %>% 
+    arrange(datetime) %>% 
+    dplyr::filter(!is.na(trading_code)) %>% 
+    mutate(trading_code = substr(trading_code, 8, 17)) %>% 
+    mutate(expire_mins = difftime(expire_date, datetime, units = "mins")) %>% 
+    select(-c(effective_date, expire_date))
+  
+  test$expire_mins = test$expire_mins %>% as.numeric()
+  return(test)
+}
+
+# Check if a single set of data is problematic
+# Helper of ChangeProbAB
+# prc1: {numeric scalar} price
+# v_i: {numeric scalar} volume
+# return: {boolen of length 1}
+IsProb = function(prc1, v1, v2, v3, v4, v5){
+  cond1 = ((v2 + v3 + v4 + v5) > 0)
+  cond2 = (v1 == 0)
+  condN1 = cond1 & cond2
+  
+  cond1 = ((v1 + v2 + v3 + v4 + v5) == 0)
+  cond2 = (prc1 != 0) 
+  condN2 = cond1 & cond2
+  return(condN1 | condN2)
+}
+
+# Change Problematic data in the datafram -- replace price to 0
+# df: {dataframe} must contain columns: first_ask_prc1, first_bid_prc1, first_ask_vol 1 ~ 5, first_bid_vol 1 ~ 5
+# return: {dataframe} chenge problem ask/bid price to 0
+ChangeProbAB = function(df){
+  ot1 = df %>% mutate(first_ask_prc1 = ifelse(IsProb(first_ask_prc1, first_ask_vol1, 
+                                                     first_ask_vol2, first_ask_vol3, 
+                                                     first_ask_vol4, first_ask_vol5),
+                                              0, first_ask_prc1),
+                      first_bid_prc1 = ifelse(IsProb(first_bid_prc1, first_bid_vol1, 
+                                                     first_bid_vol2, first_bid_vol3, 
+                                                     first_bid_vol4, first_bid_vol5), 
+                                              0, first_bid_prc1))
+  return(ot1)
+}
+
+# Helper of FillPrice
+# Fill in the price for 无成交合约
+# df: {dataframe} subset of input df in FillPrice -- see specification for FillPrice
+# return: {dataframe} fill in the price following the rules in "上证50 ETF 波动率指数编制方案" with modification to transform unit to minute
+FillNosold = function(df){
+  test1 = df %>% arrange(volume)
+  nsubset = length(test1$volume[test1$volume == 0])
+  nosold = test1[1:nsubset,] %>% 
+    mutate(mid_prc = ifelse(first_bid_prc1 == 0, 
+                          ifelse(first_ask_prc1 == 0, pre_close_prc, 
+                                 min(first_ask_prc1, pre_close_prc)),
+                          ifelse(first_ask_prc1 == 0, max(pre_close_prc, first_bid_prc1), 
+                                 (first_ask_prc1 + first_bid_prc1)/2)))
+  return(nosold)
+}
+
+# Helper of Fillsold
+# Check x 是否在 rb1 与 rb2 之间
+# x, rb1, rb2: {numeric scalar}
+# return: {boolean} of length 1
+checkRange = function(x, rb1, rb2){
+  return(( (rb1 <= x) &  (x <= rb2)) | ( (rb2 <= x) & (x <= rb1)) )
+}
+
+# Helper of FillPrice
+# Fill in the price for 成交合约
+# df: {dataframe} subset of input df in FillPrice -- see specification for FillPrice
+# return: {dataframe} fill in the price following the rules in "上证50 ETF 波动率指数编制方案" with modification to transform unit to minute
+Fillsold = function(df){
+  test1 = df %>% arrange(volume)
+  nsubset = length(test1$volume[test1$volume == 0])
+  sold = test1[(nsubset+1):nrow(test1),] %>% 
+    mutate(mid_prc = ifelse(first_bid_prc1 == 0, 
+                          ifelse(first_ask_prc1 == 0, pre_close_prc, 
+                                 min(first_ask_prc1, pre_close_prc)),
+                          ifelse(first_ask_prc1 == 0, max(pre_close_prc, first_bid_prc1), 
+                                 ifelse(checkRange(pre_close_prc, first_bid_prc1, first_ask_prc1),
+                                        pre_close_prc, 
+                                        (first_bid_prc1 + first_ask_prc1)/2))))
+  return(sold)
+}
+
+# Fill in the price for 合约
+# df: {dataframe} usually the returned df for changeProbAB(),
+# return: {dataframe} fill in the price following the rules in "上证50 ETF 波动率指数编制方案" with modification to transform unit to minute
+FillPrice = function(df){
+  nosold = FillNosold(df)
+  sold = Fillsold(df)
+  od = rbind(nosold,sold)
+  return(od) 
+}
+
+# 简单处理一下 df, 筛去不参与计算的数据
+# df: {dataframe} must contain columns: datetime, trading_code, callput, strike_prc, mid_prc, expire_mins, symbol
+# return: {dataframe} with columns: datetime, trading_code, strike_prc, callput, mid_prc, expire_mins
+# Note: new columns -- exipre_mins {numeric} 距离到期日期时间，单位为年
+ProcessOd = function(df){
+  od = df %>% select(datetime, trading_code, callput, strike_prc, mid_prc, expire_mins, symbol)
+  
+  od = od %>% group_by(trading_code, datetime) %>% 
+    arrange(datetime) %>% 
+    mutate(expire_mins = expire_mins / (24*60*365))  %>% ungroup() %>% 
+    arrange(datetime, trading_code, callput)
+  return(od)
+}
+
+# Merge processed mibar data with minute etf price
+# df: {dataframe} must contain column datetime, format "yyyy-MM-dd hh:mm:ss" and
+#                             column trading_code
+# df_stk: {dataframe} must contain column datetime, format "yyyy-MM-dd hh:mm:ss" and 
+#                                 column stock_prc, the minute stock price
+# return: {dataframe} with column datetime, trading_code, stock_prc, etc
+MergeStkPrc <- function(df, df_stk) {
+  df$datetime = df$datetime %>% as.character()
+  df_stk$datetime = df_stk$datetime %>% as.character()
+  od1 = merge(df, df_stk, by.x = "datetime", by.y = "datetime") %>% 
+    relocate(stock_prc, .after = trading_code) %>% 
+  return(od1)
+}
+
+
+# Predict implied volality value for delta = 25, 50, 75
+# df: {dataframe} containing minute delta, implied vix value for symbol
+# pred_del: {numeric scalar} the value of delta we want to predict
+# return: {numeric vector of length 3} predicted iv value for delta = 25, 50, 75
+DelIv.lm.pred <- function(df, pred_del) {
+
+  od1.fit = lm(iv~delta, data = df)
+  pred.data = data.frame(delta = pred_del)
+  pred_iv = predict(od1.fit, pred.data) %>% unname()
+  return(pred_iv)
+}
+
+
+# 寻找计算当天对应的国债利率, R 的处理在 rf 的读取后已经完成了
+# df: {dataframe} must contain column datetime
+# return: {numeric scalar} 
+FindR = function(df){
+  today = as.Date(df$datetime[1], format = "%Y-%m-%d")
+  R = subset(rf, rf$date == today)$risk
+  return(R)
+}
+
+# 计算delta的数值
+# df: {dataframe} df must be an output of MergeStkPrc()
+# core: {numeric} the number of core options taken into calculation
+# R: {numeric} the Annual continuously-compounded risk-free rate, use the function
+# return: {dataframe} the input dataframe with dividend yield (d & mu_d), implied vol(iv) and delta(delta) appended at the back
+CalcDelta <- function(df, core = 2, R) {
+  od1 = df %>% arrange(trading_code, callput) %>% 
+    pivot_wider(id_cols = c(datetime, trading_code, stock_prc, strike_prc, expire_mins), 
+                names_from = callput,
+                values_from = c(mid_prc, symbol), names_glue = "{callput}_{.value}") %>% 
+    arrange(datetime, trading_code) %>% 
+    group_by(datetime, expire_mins) %>% mutate(dif = abs(stock_prc - strike_prc)) %>% 
+    arrange(dif) %>% 
+    mutate(d = -log((c_mid_prc - p_mid_prc + (strike_prc * exp(-R *expire_mins))) / stock_prc) / expire_mins) %>% ungroup()
+  
+  od1_mud = od1 %>% group_by(datetime, expire_mins) %>% 
+    slice(1:(core))  %>% summarise(mu_d = mean(d))
+  
+  od2 = merge(od1, od1_mud, by = c("datetime", "expire_mins"), all.x = TRUE)
+  
+  od3 = od2 %>% select(-dif) %>% 
+    pivot_longer(cols = c(c_mid_prc, p_mid_prc, c_symbol, p_symbol), 
+                 names_to = c("callput", ".value"),
+                 names_pattern = "(.)_(.*)") %>% 
+    relocate(d, mu_d, .after = last_col()) %>% ungroup() %>% 
+    arrange(callput) 
+  
+  
+  od4 = od3 %>% rowwise() %>% mutate(iv = GBSVolatility(mid_prc, callput, stock_prc, strike_prc, expire_mins, r = R,
+                                                        b = R - mu_d),
+                                     delta = GBSGreeks("Delta", TypeFlag = callput, stock_prc, strike_prc, expire_mins, 
+                                                       r = R, b = R - mu_d, sigma = iv)) %>% arrange(symbol)
+  return(od4)
+}
+
+# Generate the linear regression prediction for implied volatility
+# linear regreesion: x = Delta, y = Implied Volatility
+# Prediction: delta = 25, 50, 75
+# df: {dataframe} an output of CalcDelta, must contain columns: datetime, trading_code, callput, 
+#                 delta, iv
+# return: {dataframe} with column datetime and prediction columns 
+#                     prediction column fromatting {delta_pred}_{trading_code}_{callput}
+Delta_IV <- function(df) {
+  od1 = df %>% mutate(trading_code = substr(trading_code, 1,4)) %>% rowwise() %>% 
+    mutate(signs = sign(delta)) %>% 
+    group_by(datetime,trading_code, callput) %>% nest()
+  
+  od_tag = od1 %>% transmute(datetime, trading_code, callput)
+  od_data = od1$data
+  
+  pred = lapply(od_data, calcPred, delta_prop = c(0.25,0.50, 0.75)) %>% rbindlist()
+  
+  od2 = data.frame(datetime = od_tag$datetime, trading_code = od_tag$trading_code,
+                   callput = od_tag$callput)
+  od3 = cbind(od2, pred)
+  
+  od4 = od3 %>% pivot_wider(id_cols = datetime, names_from = c(trading_code, callput),
+                            values_from = c(delta_25, delta_50, delta_75))
+  
+  return(od4)
+}
+
+# Calculate the prediction on implied volatility with references to delta
+# df: {dataframe} must contain columns delta, iv
+# delta_prop: {numeric vect} the delta values we want to calculate
+# return: {dataframe} of predicted value, column name formatting: delta_{delta_prop}
+calcPred <- function(df, delta_prop) {
+  pred = delta_prop * sign(df$delta)[1]
+  x = sapply(pred, CalcSinlePred, df = df)
+  x = x %>% matrix(nrow = 1) %>% as.data.frame()
+  colnames(x) = paste("delta_", as.character(abs(pred) *100 ), sep = "")
+  return(x)
+}
+
+# linear regression prediction on delta, where delta = ref
+# regression variables: {response} implied volatility, {dependant} delta
+# df: {dataframe} containing column delta
+# ref: {numeric scalar} value of the delta we are trying to predict
+# return: {dataframe} with columns delta_{delta_prop}
+CalcSinlePred <- function(df, ref) {
+  vec = df$delta
+  dif = data.frame(index = 1:length(vec), difference = vec - ref) %>% 
+    mutate(signs = sign(difference), difference = abs(difference)) %>%
+    group_by(signs) %>% arrange(difference) %>% slice(1) %>% ungroup() %>% select(index)
+  dif = dif %>% pull()
+  x = DelIv.lm.pred(df[dif,], ref)
+  return(x)
+}
+
+
+# Predict implied iv for just one day of data
+# od: {dataframe} a result of reading one day of data from readOne()
+# od_stk: {dataframe} a result of reading one day of minute stock price from readStkPrc
+# return: {dataframe} of predict data, with columns datetime, and prediction columns {delta_pred}_{trading_code}_{callput}
+PredIV_1day<- function(od, od_stk) {
+  od = PrepareDf(od, cdi)
+  od = od %>% ChangeProbAB() %>% FillPrice() %>% ProcessOd()
+  od = MergeStkPrc(od, od_stk)
+  R = FindR(od)
+  od = CalcDelta(od, core = 2, R = R)
+  od_pred = Delta_IV(od)
+  return(od_pred)
+}
+
+
+# Write the predicted data
+# df: {dataframe} must cotain column datetime
+# path: {character} write path, the address to store the data
+WritePred <- function(df, path) {
+  date = as.Date(head(df$datetime,1)) %>% as.character()
+  date = gsub("-", "", date)
+  path = paste(path, date, ".csv", sep = "")
+  write.csv(df, path, row.names = FALSE)
+}
+
+### other
+# Check if the close column in df contains NA
+IsContainNA <- function(df) {
+  num = sum(is.na(df$close))
+  return(num > 0)
+}
+
+```
+
+
+## Main
+```{r Main}
+om = list.files(read_path, recursive = FALSE, full.names = TRUE)
+
+omt = lapply(om, readOne)
+omstk = lapply(om, readStkPrc, type = etftype)
+pre = map2(omt, omstk, PredIV_1day)
+lapply(pre, WritePred, path = wtPath)
+```
+
+```{r One Day}
+# od = readOne(om[1])
+# od_stk = readStkPrc(om[1], etftype)
+# x = PredIV_1day(od, od_stk)
+```
+
+```{r 和锦文的对比code，}
+# jw = read.csv("/Users/cindy/Desktop/20210401_1min_copy(1).csv")
+# by = od_pred %>% select(datetime, delta_25_2104_c, delta_50_2104_c, delta_75_2104_c,
+#                         delta_25_2104_p, delta_50_2104_p, delta_75_2104_p)
+# 
+# 
+# compare = lapply(2:7, function(t){
+#   by = by[,t]
+#   jw = jw[,t]
+#   compare = data.frame(by, jw)
+#   names(compare) = c("by", "jw")
+#   return(compare)
+# })
+# 
+# 
+# plotComp <- function(df, title) {
+#   plot = ggplot(data = df, aes(x = (1:nrow(df)) %>% seq_along())) +
+#     geom_line(aes(y = by * 100, colour = "by"), colour ="red") +
+#     geom_line(aes(y = jw * 100, colour = "jw"), colour ="blue") + 
+#     labs(title = title, x = "time", y = "iv_pred")
+# }
+# 
+# nm = names(by)[-1] %>% as.list()
+# plots = map2(compare, nm, plotComp)
+# 
+# ggarrange(plotlist = plots)
+```

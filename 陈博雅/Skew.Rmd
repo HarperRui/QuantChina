@@ -1,0 +1,734 @@
+---
+title: "CBOE-Skew"
+---
+```{r Setup, message=FALSE, warning=FALSE}
+library(dplyr)
+library(data.table)
+library(tibble)
+library(tidyr)
+library(arrow)
+library(purrr)
+library(ggplot2)
+library(ggpubr)
+source("Skew_func.R")
+```
+
+
+## 需要手动输入的信息
+```{r 需要手动输入的信息}
+read_path = "/Users/cindy/Desktop/Intern/Data/201502 etft50/"
+wtPath = "/Users/cindy/Desktop/Intern/Data/Skew/ETF50/"
+
+# 三选一 "510050" "510300" or "000300"
+etftype = "510050"
+
+# 勿改, sql用
+shIze = paste(etftype %>% as.character(), ".SH", sep ="")
+case = ifelse(etftype == "000300", "index", "etf")
+```
+
+## Setup
+```{r SQL Database Connection}
+library(DBI)
+con <- DBI::dbConnect(odbc::odbc(), Driver = "ODBC Driver 17 for SQL Server", 
+    Server = "192.168.9.85", Database = "Option", UID = "sa", 
+    PWD = "lhtzb.123", Port = 1433)
+
+```
+
+```{r Data Rate import}
+## Read Rate Data
+rf = dbReadTable(con, Id(schema = "dbo", name = "rf"))
+colnames(rf) = c("date", "rate")
+rf$date = as.Date(rf$date, format = "%Y-%m-%d")
+rf$rate = log( 1 + (rf$rate / 100))
+```
+
+```{sql Contract Info, connection = con, output.var = cdi}
+select "日期", "期权代码","交易代码","行权价","前结算价","收盘价","结算价","认购认沽","上市日","到期日"
+from contract_info_daily
+where "期权标的" = ?shIze
+```
+```{r cdi Processing}
+colnames(cdi) = c("date", "symbol", "trading_code", "strike_prc", "prev_setl_prc", "close",
+                  "setl.prc","callput", "effective_date", "expire_date")
+cdi = cdi %>%  
+  mutate(callput = ifelse(callput == "认购", "c", "p"))
+
+```
+
+```{sql Contract Info, connection = con, output.var = cdi_index}
+select "期权代码","行权价","上市日", "到期日"
+from contract_info_300index
+```
+```{r cdi_index Processing}
+colnames(cdi_index) = c("trading_code", "strike_prc", "effective_date", "expire_date")
+```
+```{sql 300index Daily, connection = con, output.var = daily_300}
+select "日期","期权代码","前结算价"
+from 日行情_300index
+```
+```{r 300index Daily}
+colnames(daily_300) = c("date", "trading_code", "prev_setl_prc")
+```
+
+
+
+## Functions
+```{r}
+# —————————————————— Skew Wrapper Function ——————————————————————————
+# Take file path to the minbar data and the type of the minbar data, calculate the minute skew an write it on the designated folder
+# @param read_path {character(1)} The path to the input minbar folder (if there are multiple folders, use the parent folder file path)
+# @param case {character(1)} either "etf" or "index"
+# @param wtPath {character(1)} the designated path for data to be written on
+# @return NULL
+Skew <- function(read_path, case, wtPath) {
+  om = list.files(read_path, recursive = FALSE, full.names = TRUE )
+  MonSkew = lapply(om, readOne, case = case)
+  MonSkew = lapply(MonSkew, PrepareDf, case = case)
+  MonSkew = lapply(MonSkew, Single1500, case = case)
+  ## 如果不单独跑15:00的数据，uncomment 下面两行然后comment out 上面一行就可以了
+  # MonSkew = lapply(MonSkew, ProcessOd)
+  lstR = lapply(MonSkew, FindR)
+  Mon = map2(MonSkew, lstR, FindOdSkew)
+  print("Start Writing")
+  y = lapply(Mon, WriteSkew, write_path = wtPath)
+  print("Writing Finished")
+}
+
+# —————————————————— Skew Computing Function ——————————————————————————
+
+# Find the skew value for one day
+# @param df {dataframe} with columns:  symbol, datetime, trading_code, strike_prc, callput, expire_mins, first_ask_prc1, first_bid_prc1, price, absdiff  
+#           Usually an output of Single1500
+# @param R {numeric(1)} continuous interest rate
+# @retrun {dataframe} with column "datetime" and "Skew" 
+FindOdSkew <- function(df, R, extract=FALSE) {
+  print(df$datetime[1])
+  UniqMin = unique(df$datetime) %>%  as.character() %>% as.list()
+  test1 = lapply(UniqMin, PrepareCal, df = df, rate = R)
+  test2 = lapply(test1, function(t)
+    lapply(t, FindS))
+  skew = lapply(test2, FindSkew) %>% unlist()
+  output = data.frame(datetime = as.POSIXct(UniqMin %>% unlist()),
+                      Skew = skew)
+  output$Skew = replace_na(output$Skew, 0)
+  print(paste(df$datetime[1] %>% as.character() %>% substr(1,10), "Finished", sep = " "))
+  return(output)
+}
+
+# Helper 3 of FindOdSkew
+# Find the Skew value for a single datatime (yyyy-mm-dd HH:MM:SS)
+# @param terminfo_calc {named list(2)} list(S, tmin), 
+#                       where S {numeric(2)} the near-term & next-term price of skewness
+#                             tmin {numerical(2)} the near-term & next-term p time to expiry (min.)
+# @return {double(2)} the SKEW value
+FindSkew = function(terminfo_calc){
+  if(anyNA(terminfo_calc)){return(NA)}
+  data = terminfo_calc %>% unlist %>% unname()
+  S = c(data[1], data[3])
+  w = Findw(data[2], data[4])
+  skew = 100 - 10*(w*S[1] + (1-w)*S[2])
+  return(skew)
+}
+
+# —————————————————— Read Data ——————————————————————————
+# Read Minbar Data，一天整天的数据合并为一个dataframe
+# @param path {character} path to the data, we want to import, assume data is minbar data from datahouse
+# @param case {character scalar} the input data type, either "etf" or "index". [default = "etf"]
+# @return: {dataframe} dataframe with selected data -- see col_select
+readOne = function(path, case = "etf"){
+  if(case == "etf"){
+    od = list.files(path, recursive = TRUE,full.names = TRUE, pattern = "^sh_1000") %>%
+    lapply(function(f)
+      read_parquet(f, col_select = c("symbol","datetime", "close", "volume",
+                                     "first_ask_prc1", "first_ask_vol1", "first_ask_vol2",
+                                     "first_ask_vol3", "first_ask_vol4", "first_ask_vol5",
+                                     "first_bid_prc1", "first_bid_vol1", "first_bid_vol2",
+                                     "first_bid_vol3", "first_bid_vol4", "first_bid_vol5"))) %>%
+    rbindlist(use.names = TRUE) %>%
+    arrange(datetime) %>% 
+    mutate(symbol = as.numeric(substr(symbol, 1, 8)))
+    
+  } else {
+    od = list.files(path, recursive = TRUE, full.names = TRUE, pattern = "^cfe_io")%>%
+    lapply(function(f)
+      read_parquet(f, col_select = c("symbol", "datetime", "open", "close", "volume",
+                                      "first_ask_prc1", "first_bid_prc1"))) %>%
+    rbindlist(use.names = TRUE) %>%
+    arrange(datetime) %>%
+    mutate(callput = symbol %>% substr(8,8) %>% tolower(),
+          symbol = substr(symbol, 1, 13))
+  }
+  return(od)
+} 
+
+# —————————————————— Skew Helper Function ——————————————————————————
+
+# Combine Minbar Data & contract daily info to extract and process relavent info such as strike price, expire_mins etc
+# Note: cdi & cdi_index are obtained through pulls from sql server 
+# @param od {dataframe} usually an output of readOne(). 
+#           Merge with cdi on columns "date" and "symbol" on case "etf"; "symbol" on case "index"
+# @[UNSED]param cdi {dataframe} daily contract info pulled from sql database.
+#           Merge with od on columns "date" and "symbol" on case "etf"; "trading_code" on case "index"
+#           case "etf" use cdi; case "index" use cdi_index
+# ASSUMED TO EXIST AS IT IS PULLED FROM SQL SERVER
+# @param case {character scalar} either "etf" or "index" [default = "etf"]
+# @return {dataframe} with merged data, and expired_mins calculated
+PrepareDf = function(od, case= "etf"){
+  if(case == "etf"){
+    od$datetime = as.POSIXct(od$datetime, tz = "UTC")
+    cdiOD = cdi %>%  subset(as.Date(cdi$date) %in% unique(as.Date(od$datetime)))
+    
+    od = od %>% mutate(date = as.Date(datetime))
+    cdiOD$date =  as.Date(cdiOD$date)
+    
+    test = merge(od, cdiOD, by= c("date","symbol")) %>% rowwise() %>% 
+      mutate(close.x = ifelse(is.na(close.x), prev_setl_prc, close.x)) %>% 
+      group_by(symbol) %>%
+      mutate(pre_close_prc = c(head(prev_setl_prc,1), head(close.x, -1))) %>% ungroup() %>% 
+      select(-c(date, close.x, prev_setl_prc)) %>% 
+      arrange(datetime) %>% 
+      dplyr::filter(!is.na(trading_code)) %>% 
+      mutate(trading_code = substr(trading_code, 8, 17)) %>% 
+      mutate(expire_mins = difftime(expire_date, datetime, units = "mins")) %>% 
+      select(-c(effective_date, expire_date))
+    
+    test$expire_mins = test$expire_mins %>% as.numeric()
+  } else {
+    test = merge(od, cdi_index, by.x = "symbol", by.y ="trading_code",
+                 all.x = TRUE, all.y = FALSE) %>% 
+      mutate(trading_code = substr(symbol, 3, 6)) %>% 
+      mutate(expire_mins = difftime(expire_date, datetime, units = "mins"),
+             first_ask_prc1 = ifelse(is.na(first_ask_prc1), 0, first_ask_prc1),
+             first_bid_prc1 = ifelse(is.na(first_bid_prc1), 0, first_bid_prc1)) %>% 
+      select(-c(effective_date, expire_date)) %>% 
+      relocate(trading_code, .before = close)
+    
+    od1 = test
+    daily_300$date = daily_300$date %>% as.character()
+    od1$date = od1$datetime %>% as.character() %>% substr(1,10)
+    
+    od1 = merge(od1, daily_300, by.x = c("date", "symbol"), by.y = c("date", "trading_code"),
+                all.x = TRUE, all.y = FALSE) %>% select(-date) %>% group_by(symbol) %>% nest()
+    
+    od1[[2]] = lapply(od1[[2]], function(t){
+      pre_close_prc = c(t$prev_setl_prc[1], t$close[2:239])
+      t = cbind(t, pre_close_prc)
+    })
+    test = unnest(od1) %>% select(-c(prev_setl_prc, open, close))
+    
+    test$expire_mins = test$expire_mins %>% as.numeric()
+  }
+  return(test)
+}
+
+
+# Single out 15:00:00 to process problem date time prior and at 15:00 separately
+# @param df {dataframe} with columns datetime, first_ask_prc1, first_bid_prc1, first_ask_vol1 ~5, first_bid_vol1 ~5 (if case "index" only 1 needed),
+#           symbol, trading_cdode, strike_prc, callput, expire_mins; usually an output of PrepareDf
+# @param case {character scalar} either "etf" or "index" [default = "etf"]
+# @return {dateframe} of the same format as input, but with expired_mins, price (mid), and absdiff (absolute difference between call put) calculated
+Single1500 <- function(df, case = "etf") {
+  df$datetime = as.character(df$datetime)
+  
+  df = df %>% arrange(datetime)
+  testa = df %>% subset(datetime %>% substr(12,19) != "15:00:00")
+  ntest = nrow(df); ntesta = nrow(testa) + 1
+  testb = df[ntesta:ntest,]
+  
+  if(case == "etf"){
+    testa = testa %>% ChangeProbAB() %>% ProcessOd(case = case)
+    testb = testb %>% ProcessOd(case = case) 
+  } else {
+    testa = ProcessOd(testa, case = case)
+    testb = ProcessOd(testb, case = case)
+  }
+  
+  test = rbind(testa, testb) %>% arrange(datetime) %>% 
+    mutate(datetime = as.POSIXct(datetime, tz = "UTC"))
+  return(test)
+}
+
+# Helper 1 of Single1500
+# Change Problematic data in the datafram -- replace price to 0
+# @param df {dataframe} must contain columns: first_ask_prc1, first_bid_prc1, first_ask_vol 1 ~ 5, first_bid_vol 1 ~ 5
+# @return {dataframe} chenge problem ask/bid price to 0
+ChangeProbAB = function(df){
+  ot1 = df %>% mutate(first_ask_prc1 = ifelse(IsProb(first_ask_prc1, first_ask_vol1, 
+                                                     first_ask_vol2, first_ask_vol3, 
+                                                     first_ask_vol4, first_ask_vol5),
+                                              0, first_ask_prc1),
+                      first_bid_prc1 = ifelse(IsProb(first_bid_prc1, first_bid_vol1, 
+                                                     first_bid_vol2, first_bid_vol3, 
+                                                     first_bid_vol4, first_bid_vol5), 
+                                              0, first_bid_prc1))
+  return(ot1)
+}
+
+# Helper of ChangeProbAB
+# Check if a single set of data is problematic
+# Helper of ChangeProbAB
+# @param prc1 {numeric scalar} price
+# @param v_i {numeric scalar} volume
+# @return: {boolean}
+IsProb = function(prc1, v1, v2, v3, v4, v5){
+  cond1 = ((v2 + v3 + v4 + v5) > 0)
+  cond2 = (v1 == 0)
+  condN1 = cond1 & cond2
+  
+  cond1 = ((v1 + v2 + v3 + v4 + v5) == 0)
+  cond2 = (prc1 != 0) 
+  condN2 = cond1 & cond2
+  return(condN1 | condN2)
+}
+
+# Helper 2 of Single1500
+# Tidy, cleanup and simplify the input data
+# @param df {dataframe} must contain columns: datetime, trading_code, callput, strike_prc, expire_mins, symbol, first_ask_prc1, first_bid_prc1
+# @param case {character} either "etf" or "index" [default = "etf"]
+# @return {dataframe} with columns: datetime, trading_code, strike_prc, callput, price, expire_mins, symbol, absdif
+ProcessOd = function(df, case = "etf"){
+  if(case == "etf"){
+    od = df %>% select(symbol, datetime, trading_code, strike_prc, callput, expire_mins, first_ask_prc1, first_bid_prc1)
+    
+    od = od %>% group_by(trading_code, datetime) %>% 
+      arrange(datetime) %>% 
+      mutate(price = (first_ask_prc1 + first_bid_prc1)/2, # Price here is Midquote -- mid_prc
+             absdiff = rep(abs(diff(price)),2)) %>% ungroup() %>% 
+      arrange(datetime, trading_code, callput)
+  } else {
+    ## Bacause The trading code here does not uniquely define a callput pair, here create one for it
+    od = df %>% mutate(trad_id = paste(substr(symbol, 1, 6), substr(symbol, 9, 13), sep = "")) %>% 
+      group_by(trad_id, datetime) %>% 
+      arrange(datetime) %>% 
+      mutate(price = (first_ask_prc1 + first_bid_prc1)/2,
+             absdiff = rep(abs(diff(price)), 2)) %>% ungroup() %>% 
+      select(symbol, datetime, trading_code, strike_prc, callput, expire_mins, first_ask_prc1, first_bid_prc1, price, absdiff) %>% 
+      arrange(datetime, strike_prc, callput)
+  }
+  return(od)
+}
+
+# Extract the continuous annual interest rate from rf
+# Note: Assume rf is pulled from sql server already
+# @param df {dataframe} with column datetime
+# @return {numeric(1)} the target interst rate
+FindR = function(df){
+  today = as.Date(df$datetime[1], format = "%Y-%m-%d")
+  R = subset(rf, rf$date == today)$rate
+  return(R)
+}
+
+# Helper 1 of FindOdSkew
+# Calculate all parameters relevant to skew at a certain time tim
+# @param df {dataframe} with columns:  symbol, datetime, trading_code, strike_prc, callput, expire_mins, first_ask_prc1, first_bid_prc1, price, absdiff  
+#           Usually an output of Single1500
+# @param tim {character(1)} yyyy-mm-dd HH:MM:SS
+# @param rate {numeric(1)} annually continuous interest rate
+# @return：{named list(2)} a list storing near-term & next-term parameters separately, where each term is a list itself
+#           for each named sub-list containing elements {R, SF, KO, df}
+PrepareCal = function(df, tim, rate){
+  # print(tim)
+  test1 = subset(df, df$datetime %>% as.character() == tim )  %>% cleanup()
+  Tmin = FindTmin(test1)
+  test1 = SeparateRX(test1, Tmin)
+  
+  Tmin = Tmin %>% as.list()
+  test2 = map2(test1, Tmin, PrepareCal2, R = rate)
+  # test2 = map2(test1, Tmin, .f = function(df, min){
+  #     return(tryCatch((PrepareCal2(df, Tmin, rate)), error= function(e){print(df)} ))
+  #   })
+  test2 = lapply(test2, function(t){c(t, R = list(rate))})
+  names(test2) = c("Near", "Next")
+  return(test2)
+}
+
+# Helper 1 of PrepareCal
+# Combine callput information togather to one row
+# @param df {dataframe} with column" trading_code, callput, strike_prc, datetime, expire_mins, absdidd, price, first_ask_prc1, first_bid_prc1
+# @return {dataframe} the input df with values unchanged but organized differently. See colnames(y) for new columns
+cleanup = function(df){
+  y = df %>% arrange(trading_code, callput)
+  y = pivot_wider(df, id_cols = c(datetime, trading_code, strike_prc, expire_mins, absdiff), 
+                  names_from = c(callput), values_from = c(price, first_ask_prc1, first_bid_prc1))
+  colnames(y) = c("datetime","trading_code","strike_prc", "expire_mins", "absdiff",
+                  "call_midQ", "put_midQ", "call_ask","put_ask", "call_bid","put_bid")
+  y = y %>% relocate(call_ask, call_bid, .after = call_midQ) %>% arrange(strike_prc)
+  return(y)
+}
+
+# Helper 2 of PrepareCal
+# Find time to expiry for both near-term & next-term option (select near & next term options' expiry time)
+# @param df {dataframe} with columns expire_mins; the dataframe with all option information for a specific datetime
+# @return {numeric(2)} the time to expiry for near-term and next-term option
+FindTmin = function(df){
+  N365 = 60*24*365
+  day8min = 60*24*7
+  Tfa = unique(df$expire_mins) %>% sort(decreasing = FALSE)
+  Tfa = Tfa[Tfa > day8min] %>% head(2)
+  return(Tfa/N365)
+}
+
+# Helper 3 of PrepareCal
+# Subset and separate near-term & next term option from dataframe df based on the time to expiry information in Tmin
+# @param df {dataframe} with column expire_mins and strike_prc; dataframe containg option information at one datetime
+# @param Tmin {numeric(2)} vector containing time to expiry for near-term and next-term option
+# @return {named list(2)} a list with near-term & next-term options as two separate dataframes
+SeparateRX = function(df, Tmin){
+  m365 = 60*24*365
+  nr = df %>% subset((df$expire_mins /m365) == (Tmin[1])) %>% arrange(strike_prc)
+  nx = df %>% subset((df$expire_mins /m365) == (Tmin[2])) %>% arrange(strike_prc)
+  return(list(nr = nr,nx = nx))
+}
+
+# Helper 4 of PrepareCal
+# Calculate all parameters (FOR A SINGLE TERM) relevant to skew at a certain time tim
+# @param term {dataframe} with a sigle term's options 
+# @param Tmin {numeric(1)} the time to expiry corresponding to this term
+# @param R {numeric(!)} the annual continuous intere rate
+# @return {named list(3)} list with elements {SF, KO, term}. see VIX manual for information about SF and K0
+PrepareCal2 =  function(term, Tmin, R){
+  SF = FindSF(term, Tmin,R)
+  if (anyNA(SF)) {return(list(Tmin = NA, SF = NA, K0 = NA, df = NA))}
+  term = Elim_str(term, SF[1])
+  K0 = Findk0(term, SF[2])
+  term = term %>% arrange(strike_prc, decreasing = FALSE)
+  term$Ki = sort(term$strike_prc, decreasing = FALSE)
+  term$detKi = FindDetKi(term$Ki)
+  term = FindPki(term, K0)
+  param = list(Tmin = Tmin, SF = SF, K0 = K0, df = term)
+  return(param)
+}
+
+# Helper 1 of PrepareCal2
+# Find the option with the smallest absolute difference in its callput mid price and calculate its corresponding forwarding price
+# @param df {dataframe} with columns call_bid, put_bid, absdiff, call_midQ, put_midQ
+# @param Tmin {numeric(1)} the time to expiry corresponding to this term
+# @param R {numeric(!)} the annual continuous intere rate
+# @return {numeric(2)} vector with target option's strike and strike's corresponding forward price
+FindSF =  function(df, Tmin, R){
+  df = df %>% filter( (call_bid != 0) & (put_bid != 0))
+  if (nrow(df) == 0) {return(c(NA,NA))}
+  tib = subset(df, df$absdiff == min(df$absdiff))
+  S = tib$strike_prc[1]
+  Fa = S + (exp(R * Tmin)) * (tib$call_midQ - tib$put_midQ)
+  # print(c(S, Fa,tib$call_midQ, tib$put_midQ, tib$call_midQ - tib$put_midQ))
+  return(c(S, Fa))
+}
+
+# Helper 2 of PrepareCal2
+# Eliminate strikes based on the CBOE Skew Whitepaper section
+# @param df {dataframe} with columns strike_prc, call_bid, put_bid
+# @param S {numeric(1)} the strike price for the pair of options with the smallest absolute difference in callput mid price
+# @return {dateframe} the input dataframe with invalid strikes eliminated
+Elim_str <- function(df, S) {
+  if(is.na(S)){return(NA)}
+  nam = colnames(df)
+  Sindex = which(df$strike_prc == S) %>% as.numeric()
+  n = nrow(df)
+  
+  sdf = slice(df, Sindex)
+  if(Sindex <= 1){pdf =  rep(NA, ncol(sdf)) %>% as.matrix() %>% t() %>% as.data.frame(); colnames(pdf) = nam} else {pdf = df[1:(Sindex-1),]}
+  if(Sindex >= n) {cdf = rep(NA, ncol(sdf)) %>% as.matrix() %>% t() %>% as.data.frame(); colnames(cdf) = nam} else {cdf = df[(Sindex + 1):n,]}
+  
+  if (! is.na(cdf[1,1])){
+    call_bid = cdf$call_bid
+    cbc = rle(call_bid)
+    cbc = data.frame(value = cbc$values, lengths = cbc$lengths)
+    cb_idx = which(cbc$value == 0 & cbc$lengths >= 2) %>% first()
+    cons = cbc$length[cb_idx] -1
+    if(any(cb_idx)){
+      c_idx = sum(cbc$lengths[1:(cb_idx)]) - cons
+      cdf = cdf[1:(cons -1),] %>% filter(call_bid != 0)
+    } 
+  }
+  
+  if (! is.na(pdf[1,1])){
+    put_bid = pdf$put_bid
+    pbc = rle(put_bid)
+    pbc = data.frame(value = pbc$values, lengths = pbc$lengths)
+    pb_idx = which(pbc$value == 0 & pbc$lengths >= 2) %>% last()
+    if(any(pb_idx)){
+      p_idx = sum(pbc$lengths[1:(pb_idx)]) + 1
+      pdf = pdf[p_idx:nrow(pdf),] %>% filter(put_bid != 0)
+    }
+  }
+
+  df = rbind(pdf, sdf, cdf) %>% na.omit()
+  colnames(df) = nam
+  return(df)
+}
+
+# Helper 3 of PrepareCal2
+# Find K0, the strike price that is not only smaller than F and but also closest to F
+# @param df {dataframe} with column strike_prc; dataframe containing this term's option information.
+# @param Fa {numeric(1)} the forward price to be compared with
+# @return {numeric(1)} the strike price with are trying to find
+Findk0 = function(df, Fa){
+  strk_prc = df$strike_prc
+  k01 = strk_prc[strk_prc < Fa]
+  k01 = sort(k01, decreasing = TRUE)[1]
+  return(k01)
+}
+
+# Helper 4 of PrepareCal2
+# Compute the change in strike price
+# @param Ki {numeric vector} a term's option strike price ordered from the smallest to the biggest
+# @return {numeric vector} vector of the same length of Ki.
+FindDetKi = function(Ki){
+  n = length(Ki)
+  # if(n == 0){print("length of Ki is 0"); return()}
+  # if(n == 1){print("length of Ki is 1");return(0)}
+  # if (n == 2){print("length of Ki is 2"); return(rep(Ki[2]-Ki[1],2))}
+  
+  if(n == 0){return()}
+  if(n == 1){return(0)}
+  if (n == 2){return(rep(Ki[2]-Ki[1],2))}
+  
+  Kp = Ki[3:n]
+  Km = Ki[1:(n-2)]
+  det = (Kp - Km)/2
+  s = Ki[2] - Ki[1]
+  e = Ki[n] - Ki[n-1]
+  return(c(s,det,e))
+}
+
+# Helper 5 of PrepareCal2
+# Decide which price to use based on the vix manual
+# 寻找填充P(ki), 
+# 若Ki⼩于K0，为Ki对应的认沽期权价格；
+# 若Ki⼤于K0，为Ki对应的认购期权价格；
+# 若Ki等于K0，为Ki对应的认沽期权价格与认购期权价格均值
+# @param df {datafram} with columns Ki, put_midQ, call_midQ
+# @param k0 {numeric(1)} the strike price that is not only smaller than F and but also closest to F
+FindPki = function(df, k0){
+  df = df %>% mutate(pki = ifelse(Ki < k0, put_midQ, ifelse(Ki > k0, call_midQ, (call_midQ + put_midQ)/2)))
+  return(df)
+}
+
+# Helper 2 of FindOdSkew
+# Find a single term's price of skewness
+# @param termInfo {named list(5)} with element {Tmin, SF, KO, df, R}
+# @return {named list(2)} with elment {S, Tmin}
+FindS = function(termInfo){
+  if (anyNA(termInfo)){return(list(S = NA, Tmin = NA))}
+  P = FindP(termInfo) 
+  S = (P[3] - 3*P[1]*P[2] + 2*P[1]^3) / ((P[2] - P[1]^2)^1.5)
+  S = list(S = S, Tmin = termInfo$Tmin)
+  return(S)
+}
+
+# Helper of FindS
+# Find P1,P2, P3 for the term (part of the calculate parameter in SKEW whitepaper)
+# @param termInfo {named list(5)} with elements {Tmin, SF, KO, df, R}
+# @retrun {numeric(3)} vector containing {P1,P2,P3}
+FindP = function(termInfo){
+  eRT = FindeRT(termInfo$R, termInfo$Tmin)
+  Er = FindEr(termInfo$SF[2], termInfo$K0)
+  xyz = Findxyz(termInfo$df, termInfo$SF[2])
+  
+  eRT = c(-eRT, eRT, eRT)
+  P = eRT * xyz + Er
+  return(P)
+}
+
+# Helper 1 of FindP
+# Find exp(R*T)  (part of the calculate parameter in SKEW whitepaper)
+# @param R {numeric(1)} annual continuous interest rate
+# @param Tmin {numeric(1)} the time to expiry corresponding to this term
+# @return {numeric(1)} exp(R*T) calculated
+FindeRT = function(R, Tmin){
+  return(exp(R*Tmin))
+}
+
+# Helper 2 of FindP
+# Find the three epsilons (part of the calculate parameter in SKEW whitepaper)
+# @param F0 {numeric(1)} the forward price
+# @param K0 {numeric(1)} the smallest strike price
+# @return {numeric(3)} vector of epsilons {e1,e2,e3}
+FindEr = function(F0, K0){
+  FdK = F0/K0
+  KdF = K0/F0
+  
+  e1 = - (1 + log(FdK) - FdK)
+  e2 = 2 * log(KdF)*(FdK-1) + 0.5*(log(KdF)^2)
+  e3 = 3 * log(KdF)^2 * (1/3 * log(KdF) -1 + FdK)  
+  return(c(e1, e2, e3))
+}
+
+# Helper 3 of FindP
+# Find x,y,z values (corresponding to forP1, forP2, forP3 values on CBOE Skew WhitePaper)
+# @param df {dataframe} with columns deltaKi, Ki, pki
+# @param Fo {numeric(1)} the forward price
+# @return {numeric(3)} vector of {sum x, sum y, sum z}
+Findxyz = function(df, Fo){
+  df = df %>% mutate(x = detKi/(Ki^2) * pki,
+                     y = 2 * x * (1 - log(Ki/Fo)),
+                     z = 3*x * (2* log(Ki/Fo) - log(Ki/Fo)^2 ))
+  return(c(sum(df$x), sum(df$y), sum(df$z)))
+}
+
+# Helper of FindSkew
+# Calculate the weights corresponding to the near-term and next-term options
+# @param NR_exp_min {numeric(1)} the near-term options' time to expiry
+# @param NX_exp_min {numeric(1)} the next-term options' time to expiry
+# @return {numeric(1)} the weight of the near-term options (the other weight w2 can be compute simply using 1 - w)
+Findw =  function(NR_exp_min, NX_exp_min){
+  T365 = 60*24*365
+  Tnr = NR_exp_min * T365
+  Tnx = NX_exp_min * T365
+  T30 = 60*24*30
+  w = (Tnx - T30) / (Tnx - Tnr)
+  return(w)
+}
+
+
+# —————————————————— Write Data ——————————————————————————
+
+# Write datafram df to write_path
+# @param df {dataframe} with column datetime and Skew
+# @param write_path {character} the write path. must contain the folder separation symbol at the end
+WriteSkew <- function(df, write_path) {
+  date = as.Date(head(df$datetime,1)) %>% as.character()
+  date = gsub("-", "", date)
+  path = paste(write_path, date, ".csv", sep = "")
+  write.csv(df, path, row.names = FALSE)
+}
+
+
+# —————————————————— Not Used ——————————————————————————
+
+# Generate the Frequency Table for given skew 
+SkewFreq <- function(df) {
+  Skew_Freq  = hist(df$Skew)
+  Skew = Skew_Freq$breaks
+  Frequency = c(0, Skew_Freq$density) * 100
+  Skew_Freq = data.frame(Skew = Skew, Frequency = Frequency)
+  Skew_Freq
+}
+
+# 寻找波动率（squared）
+FindSig2 = function(df, Tmin, R, SF, K0){
+  p1 = 2/Tmin
+  p2.1 = df$detKi/((df$Ki)^2) * exp(R*Tmin) * df$pki
+  p2 = sum(p2.1)
+  p3 = 1/Tmin * (SF[2]/K0 -1)^2
+  x = p1*p2 - p3
+  return(x)
+}
+
+# Find consecutive 0's
+# Return return a rle list of which values only contain 0
+Find0 <- function(vec) {
+  rle.vec = rle(vec)
+  ocur_0 = which(rle.vec$values == 0)
+  rle.vec = lapply(rle.vec, function(t) t[ocur_0])
+  return(rle.vec)
+}
+
+
+## Fill in the price for 无成交合约
+FillNosold = function(df){
+  test1 = df %>% arrange(volume)
+  nsubset = length(test1$volume[test1$volume == 0])
+  nosold = test1[1:nsubset,] %>% 
+    mutate(price = ifelse(first_bid_prc1 == 0, 
+                          ifelse(first_ask_prc1 == 0, pre_close_prc, 
+                                 min(first_ask_prc1, pre_close_prc)),
+                          ifelse(first_ask_prc1 == 0, max(pre_close_prc, first_bid_prc1), 
+                                 (first_ask_prc1 + first_bid_prc1)/2)))
+  return(nosold)
+}
+
+## Check x 是否在 rb1 与 rb2 之间
+checkRange = function(x, rb1, rb2){
+  return(( (rb1 <= x) &  (x <= rb2)) | ( (rb2 <= x) & (x <= rb1)) )
+}
+
+## Fill in the price for 成交合约
+Fillsold = function(df){
+  test1 = df %>% arrange(volume)
+  nsubset = length(test1$volume[test1$volume == 0])
+  sold = test1[(nsubset+1):nrow(test1),] %>% 
+    mutate(price = ifelse(first_bid_prc1 == 0, 
+                          ifelse(first_ask_prc1 == 0, pre_close_prc, 
+                                 min(first_ask_prc1, pre_close_prc)),
+                          ifelse(first_ask_prc1 == 0, max(pre_close_prc, first_bid_prc1), 
+                                 ifelse(checkRange(pre_close_prc, first_bid_prc1, first_ask_prc1),
+                                        pre_close_prc, 
+                                        (first_bid_prc1 + first_ask_prc1)/2))))
+  return(sold)
+}
+
+## Fill in the price for 合约
+FillPrice = function(df){
+  nosold = FillNosold(df)
+  sold = Fillsold(df)
+  od = rbind(nosold,sold)
+  return(od) 
+}
+
+
+# 计算出一个时刻的vix指数
+# df: {dataframe} usually an output of ProcessOd()
+# it: {numeric scalar} 一天从开盘后的第几分钟
+# return: {dataframe} with calculated vix for the datetime corresponding to it
+getVix = function(df,it){
+  x = df[it,]
+  s1 = x[1]; s2 = x[2]; t1 = x[3]; t2 = x[4]
+  n365 = 60*24*365; n30 = 60*24*30; nt1 = t1*n365; nt2 = t2*n365
+  
+  if (nt1 > n30) {
+    s1 * 100
+  } else {
+    vp1.1 = t1*(s1^2) * ( (nt2 - n30) / (nt2 - nt1) )
+    vp1.2 = t2*(s2^2) * ( (n30 - nt1) / (nt2 - nt1) )
+    vp1 = vp1.1 + vp1.2
+    vix = sqrt(vp1 * (n365/n30)) * 100
+    vix
+  }
+}
+
+# 计算出一天的 vix 指数
+# df: {dataframe} usually an output of ProcessOd()
+# return: {dataframe} with calculated vix for every datetime in df
+getOdVix = function(df){
+  unqTime = rownames(df)
+  it = 1:(nrow(df))
+  vix = sapply(it, getVix, df = df)
+  
+  # Add timestamp 
+  vix = t(vix)
+  colnames(vix) = unqTime
+  vix = t(vix)
+  return(vix)
+}
+```
+
+
+
+## Main
+```{r Main, message=FALSE, warning=FALSE}
+## 这之前所有的 code chunk 都应该被跑一遍
+Skew(read_path, case, wtPath)
+```
+
+## Test Use
+```{r ETF}
+# om = list.files(read_path, recursive = FALSE, full.names = TRUE )
+# t1 = readOne(om[2], case = case)
+# t1 = PrepareDf(t1, case)
+# t2 = Single1500(t1, case)
+# tR = FindR(t2)
+# t3 = FindOdSkew(t2, tR)
+```
+
+```{r Index}
+# om = list.files(read_path, recursive = FALSE, full.names = TRUE )
+# i1 = readOne(om[1], case = case)
+# i1 = PrepareDf(i1, case = "index")
+# i2 = Single1500(i1, case = "index")
+# iR = FindR(i2)
+# i3 = FindOdSkew(i2, iR)
+```

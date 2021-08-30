@@ -1,0 +1,351 @@
+---
+title: "CEV Model"
+
+---
+
+```{r Setup, message=FALSE, warning=FALSE}
+library(arrow)
+library(pracma)
+library(data.table)
+library(tidyr)
+library(dplyr)
+library(purrr)
+library(fOptions)
+library(FER)
+library(optimParallel)
+library(geoR)
+library(ggplot2)
+source("CEV_model_funcs.R")
+```
+
+## 需要手动输入的
+```{r 需要手动输入的信息}
+read_path = "/Users/cindy/Desktop/Intern/Data/202104PRim"
+wtPath = "/Users/cindy/Desktop/Intern/Data/04DeltaVol/"
+etftype = 510050
+
+# 勿改, sql用
+shIze = paste(etftype %>% as.character(), ".SH", sep ="")
+```
+
+## Setup
+```{r}
+library(DBI)
+con <- DBI::dbConnect(odbc::odbc(), Driver = "ODBC Driver 17 for SQL Server", 
+    Server = "192.168.9.85", Database = "Option", UID = "sa", 
+    PWD = "lhtzb.123", Port = 1433)
+
+```
+
+
+```{r Data Risk import}
+## Read Risk Data
+rf = dbReadTable(con, Id(schema = "dbo", name = "rf"))
+colnames(rf) = c("date", "risk")
+rf$date = as.Date(rf$date, format = "%Y-%m-%d")
+rf$risk = log( 1 + (rf$risk / 100))
+```
+
+```{sql Contract Info, connection = con, output.var = cdi}
+select "日期", "期权代码","交易代码","行权价","前结算价","收盘价","结算价","认购认沽","上市日","到期日"
+from contract_info_daily
+where "期权标的" = ?shIze
+```
+
+```{r cdi Processing}
+colnames(cdi) = c("date", "symbol", "trading_code", "strike_prc", "prev_setl_prc", "close",
+                  "setl.prc","callput", "effective_date", "expire_date")
+cdi = cdi %>%  
+  mutate(callput = ifelse(callput == "认购", "c", "p"))
+
+```
+
+## Main
+```{r Main}
+om = list.files(read_path, recursive = FALSE, full.names = TRUE)
+# omt = lapply(om, readOne)
+# omstk = lapply(om, readStkPrc, type = etftype)
+# pre = map2(omt, omstk, PredIV_1day)
+# lapply(pre, WritePred, path = wtPath)
+```
+
+```{r One Day}
+od0401  = readOne(om[1])
+od_stk0401 = readStkPrc(om[1], type = etftype)
+
+od = PrepareDf(od0401, cdi)
+od = od %>% ChangeProbAB() %>% FillPrice() %>% ProcessOd()
+od = MergeStkPrc(od, od_stk0401)
+R = FindR(od)
+od = CalcSigma(od, core = 2, R = R)
+
+```
+
+```{r}
+etf = od_stk0401$stock_prc[1]
+
+od_for = od %>% rowwise() %>% mutate(df = exp(- R * expire_mins),
+                                     forward = etf * exp(-mu_d * expire_mins) / df)
+
+
+
+od1 = od_for %>% group_by(datetime) %>% nest()
+
+od2 = od1[[2]][[1]] %>% group_by(expire_mins) %>% nest()
+
+od3 = od2[[2]][[1]] %>% pivot_wider(id_cols = c(strike_prc, forward), names_from = callput,
+                                    names_prefix = "bs_sigma_", values_from = sigma) %>%
+  mutate(market_iv = ifelse(strike_prc >= etf, bs_sigma_c, bs_sigma_p)) %>%
+  select(-(3:4))
+
+od3 = list(t = od2$expire_mins[1], od2 = od3)
+
+
+test = SABR.calibration(od3$t, od3$od2$strike_prc, od3$od2$forward, od3$od2$market_iv)
+test = test %>% unname() %>% as.numeric()
+# 1/(od3$od2$forward^(1-test[2]))
+
+test_iv = CEV_iv(od3$od2$strike_prc/od3$od2$forward, od3$t, 
+                 test[1]/(od3$od2$forward^(1-test[2])), test[2], test[3], test[4])
+
+# test_iv = od3$od2$forward^(1-test[2])*test_iv
+
+data = od3$od2
+data$cev_iv = test_iv
+
+
+ggplot(data= data, aes(x=strike_prc)) +
+  geom_point(aes(y = cev_iv * 100, iv_type = "cev")) +
+  geom_smooth(aes(y = cev_iv * 100), color = "red") +
+  geom_point(aes(y = market_iv * 100, iv_type = "market")) +
+  geom_smooth(aes(y = market_iv * 100), color = "blue") +
+  labs(title = "Volatility Curve", x = "Strike Price", y = "Implied Volatility") +
+  theme(legend.position = "right")
+```
+
+
+
+
+```{r Brent CEV chisquare dont converge}
+rm(od1,od2,od3, etf, test, test_c, test_parm_c, test_p, test1, test2, data)
+
+# Extracting 09:25 time to maturity ___ data
+etf = od_stk0401$stock_prc[1] # stock prc from od at time t
+
+od_for = od %>% rowwise() %>% mutate(df = exp(- R * expire_mins),
+                                     forward = etf * exp(-mu_d * expire_mins) / df)
+
+od1 = od_for %>% group_by(datetime) %>% nest()
+
+od2 = od1[[2]][[1]] %>% group_by(expire_mins) %>% nest()
+
+od3 = od2[[2]][[1]] 
+
+# Method Unique Processing, comput otm first
+od3 = od3 %>% pivot_wider(id_cols = c(trading_code, stock_prc, strike_prc,d,mu_d,df,forward), 
+                          names_from = callput, names_glue = "{callput}_{.value}", 
+                          values_from = c(symbol, mid_prc, sigma))  %>% arrange(strike_prc) %>% 
+  mutate(isC = strike_prc >= stock_prc,
+         mkt_prc = ifelse(isC, c_mid_prc, p_mid_prc),
+         mkt_iv = ifelse(isC, c_sigma, p_sigma),
+         callput = ifelse(isC, 1, -1)) %>% 
+  select(-c(c_mid_prc, c_sigma, p_mid_prc, p_sigma, isC))
+
+od3 = list(t = od2$expire_mins[1], stock = od3$stock_prc[1],  mu_d = od3$mu_d[1], df = od3$df[1],
+          forward = od3$forward[1], od2 = od3 %>% transmute(trading_code, c_symbol, p_symbol, callput,
+                                                            strike_prc, mkt_prc, mkt_iv)) 
+
+
+# Starting to Calibrate
+od3$od2 = od3$od2 %>% slice(1:13)
+
+test = CEV_calibration(mid = od3$od2$mkt_prc, k = od3$od2$strike_prc, f = od3$forward, t = od3$t,
+                       df = od3$df, cp = od3$od2$callput, mu_d = od3$mu_d)
+
+```
+
+```{r 死循环 Ver}
+rm(od1,od2,od3, etf, test, test_c, test_parm_c, test_p, test1, test2, data)
+
+etf = od_stk0401$stock_prc[1] # stock prc from od at time t
+
+od_for = od %>% rowwise() %>% mutate(df = exp(- R * expire_mins),
+                                     forward = etf * exp(-mu_d * expire_mins) / df)
+
+od1 = od_for %>% group_by(datetime) %>% nest()
+
+od2 = od1[[2]][[1]] %>% group_by(expire_mins) %>% nest()
+
+od3 = od2[[2]][[1]] 
+# %>% pivot_wider(id_cols = strike_prc, names_from = callput,
+#                                     names_prefix = "bs_sigma_", values_from = sigma)
+
+od3 = list(t = od2$expire_mins[1], od2 = od3)
+
+test = od3$od2
+
+test = test %>% rowwise() %>% mutate(callput = ifelse(callput == "c", 1, -1)) %>% 
+  mutate(param = CEV_calibration(mid = mid_prc, etf = stock_prc, k = strike_prc, r = R, 
+                                 d = mu_d, texp = od3$t, cp = callput))
+
+
+
+test_c = test %>% subset(test$callput == "c")
+test_parm_c = CEV_calibration(test_c$mid_prc, , test_c$forward, od3$t, 
+                            intrDF = test_c$df, cp = 1, d = test_c$mu_d)
+test_parm_c = test_parm_c %>% coefficients()
+
+test_c$cev_prc = CevPrice(strike = test_c$strike_prc, forward = test_c$forward, texp = od3$t,
+                          sigma = test_parm_c["a"], beta = test_parm_c["b"], df = test_c$df,
+                          cp = 1, divr = test_c$mu_d)
+
+test_p = test %>% subset(test$callput == "p")
+# test_parm_p = CEV_calibration_put(test_p$mid_prc, test_p$strike_prc, test_p$forward, od3$t,
+#                             intrDF = test_p$df, cp = -1, d = test_p$mu_d)
+test_p$cev_prc = CevPrice(strike = test_p$strike_prc, forward = test_p$forward, texp = od3$t,
+                          sigma = test_parm_c["a"], beta = test_parm_c["b"], df = test_p$df,
+                          cp = -1, divr = test_p$mu_d)
+
+test = rbind(test_c, test_p)
+test = test %>% rowwise() %>% mutate(cev_vol = GBSVolatility(cev_prc, callput, stock_prc, 
+                                                             strike_prc, od3$t, r = R, 
+                                                             b = R - mu_d))
+
+test1 = test %>% pivot_wider(id_cols = strike_prc, names_from = callput, names_prefix = "cev_iv_",
+                             values_from = cev_vol) %>% 
+  rowwise() %>% mutate(cev_iv = ifelse(strike_prc >= etf, cev_iv_c * 100, cev_iv_p *100)) %>% select(-(2:3))
+
+test2 = test %>% pivot_wider(id_cols = strike_prc, names_from = callput, names_prefix = "bs_iv_",
+                             values_from = sigma) %>% 
+  rowwise() %>% mutate(market_iv = ifelse(strike_prc >= etf, bs_iv_c * 100, bs_iv_p *100)) %>%
+  select(-(2:3))
+
+data = merge(test1, test2, by = "strike_prc")
+
+ggplot(data= data, aes(x=strike_prc)) +
+  geom_point(aes(y = cev_iv)) +
+  geom_smooth(aes(y = cev_iv, color = "red")) +
+  geom_point(aes(y = market_iv)) +
+  geom_smooth(aes(y = market_iv, color = "blue")) +
+  labs(title = "Volatility Curve", x = "Strike Price", y = "Implied Volatility") +
+  theme(legend.position = "top") +
+  scale_color_identity(name = "iv_type", breaks = c("red", "blue"), 
+                       labels = c("CEV", "Market"),
+                       guide = "legend")
+```
+
+
+```{r Method Matlab into R}
+rm(od1,od2,od3, etf, test, test_c, test_parm_c, test_p, test1, test2, data)
+
+etf = od_stk0401$stock_prc[1] # stock prc from od at time t
+
+od_for = od %>% rowwise() %>% mutate(df = exp(- R * expire_mins),
+                                     forward = etf * exp(-mu_d * expire_mins) / df)
+
+od1 = od_for %>% group_by(datetime) %>% nest()
+
+od2 = od1[[2]][[1]] %>% group_by(expire_mins) %>% nest()
+
+od3 = od2[[2]][[1]] 
+# %>% pivot_wider(id_cols = strike_prc, names_from = callput,
+#                                     names_prefix = "bs_sigma_", values_from = sigma)
+
+od3 = list(t = od2$expire_mins[1], od2 = od3)
+
+test = od3$od2
+
+test_c = test %>% subset(test$callput == "c")
+test_parm_c = CEV_calibration(test_c$mid_prc, test_c$strike_prc, test_c$forward, od3$t, 
+                            intrDF = test_c$df, cp = 1, d = test_c$mu_d)
+test_parm_c = test_parm_c$par; test_parm_c
+
+test_c$cev_prc = CevPrice(strike = test_c$strike_prc, forward = test_c$forward, texp = od3$t,
+                          sigma = test_parm_c["a"], beta = test_parm_c["b"], df = test_c$df,
+                          cp = 1, divr = test_c$mu_d)
+
+test_p = test %>% subset(test$callput == "p")
+# test_parm_p = CEV_calibration_put(test_p$mid_prc, test_p$strike_prc, test_p$forward, od3$t,
+#                             intrDF = test_p$df, cp = -1, d = test_p$mu_d)
+test_p$cev_prc = CevPrice(strike = test_p$strike_prc, forward = test_p$forward, texp = od3$t,
+                          sigma = test_parm_c["a"], beta = test_parm_c["b"], df = test_p$df,
+                          cp = -1, divr = test_p$mu_d)
+
+test = rbind(test_c, test_p)
+test = test %>% rowwise() %>% mutate(cev_vol = GBSVolatility(cev_prc, callput, stock_prc, 
+                                                             strike_prc, od3$t, r = R, 
+                                                             b = R - mu_d))
+
+test1 = test %>% pivot_wider(id_cols = strike_prc, names_from = callput, names_prefix = "cev_iv_",
+                             values_from = cev_vol) %>% 
+  rowwise() %>% mutate(cev_iv = ifelse(strike_prc >= etf, cev_iv_c * 100, cev_iv_p *100)) %>% select(-(2:3))
+
+test2 = test %>% pivot_wider(id_cols = strike_prc, names_from = callput, names_prefix = "bs_iv_",
+                             values_from = sigma) %>% 
+  rowwise() %>% mutate(market_iv = ifelse(strike_prc >= etf, bs_iv_c * 100, bs_iv_p *100)) %>%
+  select(-(2:3))
+
+data = merge(test1, test2, by = "strike_prc")
+
+ggplot(data= data, aes(x=strike_prc)) +
+  geom_point(aes(y = cev_iv)) +
+  geom_smooth(aes(y = cev_iv, color = "red")) +
+  geom_point(aes(y = market_iv)) +
+  geom_smooth(aes(y = market_iv, color = "blue")) +
+  labs(title = "Volatility Curve", x = "Strike Price", y = "Implied Volatility") +
+  theme(legend.position = "top") +
+  scale_color_identity(name = "iv_type", breaks = c("red", "blue"), 
+                       labels = c("CEV", "Market"),
+                       guide = "legend")
+
+# ggplot(data = test, aes(x = 1:nrow(test))) +
+#   geom_point(aes(y = mid_prc, colour = "blue")) +
+#   geom_point(aes(y = cev_prc, colour = "red")) +
+#   scale_color_identity(name = "prc_type", breaks = c("red", "blue"), 
+#                        labels = c("CEV", "Market"),
+#                        guide = "legend")
+
+```
+
+
+
+```{r Method: SABR. vov = 0}
+etf = od_stk0401$stock_prc[1]
+
+od_for = od %>% rowwise() %>% mutate(df = exp(- R * expire_mins),
+                                     forward = etf * exp(-mu_d * expire_mins) / df)
+
+
+
+od1 = od_for %>% group_by(datetime) %>% nest()
+
+od2 = od1[[2]][[1]] %>% group_by(expire_mins) %>% nest()
+
+od3 = od2[[2]][[1]] %>% pivot_wider(id_cols = c(strike_prc, forward), names_from = callput,
+                                    names_prefix = "bs_sigma_", values_from = sigma) %>%
+  mutate(market_iv = ifelse(strike_prc >= etf, bs_sigma_c, bs_sigma_p)) %>%
+  select(-(3:4))
+
+od3 = list(t = od2$expire_mins[1], od2 = od3)
+
+
+test = SABR.calibration(od3$t, od3$od2$strike_prc, od3$od2$forward, od3$od2$market_iv)
+test
+
+
+test_iv = SabrHagan2002(strike = od3$od2$strike_prc, forward = od3$od2$forward, texp = od3$t,
+                        sigma = test[3], vov = 0, rho = test[2], beta = test[1])
+
+data = od3$od2
+data$cev_iv = test_iv
+
+
+ggplot(data= data, aes(x=strike_prc)) +
+  geom_point(aes(y = cev_iv, iv_type = "cev")) +
+  geom_smooth(aes(y = cev_iv), color = "red") +
+  geom_point(aes(y = market_iv, iv_type = "market")) +
+  geom_smooth(aes(y = market_iv), color = "blue") +
+  labs(title = "Volatility Curve", x = "Strike Price", y = "Implied Volatility") +
+  theme(legend.position = "right")
+```
+

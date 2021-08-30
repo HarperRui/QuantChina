@@ -1,0 +1,791 @@
+---
+title: "Garch HV"
+output: html_notebook
+---
+
+
+```{r Packages, message=FALSE, warning=FALSE, include=FALSE}
+library(tseries)
+library(rugarch)
+library(PerformanceAnalytics)
+library(dplyr)
+library(DataCombine)
+library(xts)
+library(tibble)
+library(tidyr)
+library(ggpubr)
+library(repr)
+```
+
+
+```{r DB version, message=FALSE, warning=FALSE, include=FALSE}
+library(DBI)
+library(odbc)
+
+con <- DBI::dbConnect(odbc::odbc(),
+                      Driver   = "ODBC Driver 17 for SQL Server",
+                      Server   = "192.168.9.85",
+                      Database = "Option",
+                      UID      = "sa",
+                      PWD      = "lhtzb.123",
+                      Port     = 1433)
+
+garch_fam = dbReadTable(con, Id(schema="dbo", name="etf_garch"))
+HV = dbReadTable(con, Id(schema = "dbo", name = "HV"))
+```
+
+```{r Offline version, include=FALSE}
+# garch_fam = read.csv("/Users/cindy/Desktop/Intern/GarchHV/etf_garch.csv", na.strings = "NULL")
+# HV = read.csv("/Users/cindy/Desktop/Intern/GarchHV/etf_hv.csv", na.strings = "NULL")
+```
+
+
+```{r Pre Data Processing, include=FALSE}
+# Fate format
+garch_fam$Date = as.Date(garch_fam$Date, format = "%Y-%m-%d")
+HV$Date = as.Date(HV$Date, format = "%Y-%m-%d")
+
+# select useful cols & change name
+garch_fam = garch_fam %>% select(Date, Code, close)
+HV = HV %>% select(Date, Code, HV20, HV20_ghost)
+
+# Find date discrepancy -- Shoul be zero
+# t50g = subset(garch_fam, garch_fam$Code == "510050.SH")$Date
+# t50h = subset(HV, HV$Code == "510050.SH")$Date
+# datedis50 = t50h[!(t50h %in% t50g)]
+# rm(t50g, t50h)
+# 
+# t300g = subset(garch_fam, garch_fam$Code == "510300.SH")$Date
+# t300h = subset(HV, HV$Code == "510300.SH")$Date
+# datedis300 = t300h[!(t300h %in% t300g)]
+# rm(t300g, t300h)
+
+# Separate 50 & 300
+g50 = subset(garch_fam, garch_fam$Code == "510050.SH")
+g300 = subset(garch_fam, garch_fam$Code == "510300.SH")
+h50 = subset(HV, HV$Code == "510050.SH")
+h300 = subset(HV, HV$Code == "510300.SH")
+# rm(garch_fam, HV) TODO: add uncomment when done
+
+# Return Calulation
+g50 = g50 %>% mutate(log.ret = CalculateReturns(xts(g50$close, g50$Date), method = "log"))
+g300 = g300 %>% mutate(log.ret = CalculateReturns(xts(g300$close, g300$Date), method = "log"))
+
+gh50 = data.frame(Date = g50$Date, Code = g50$Code, close = g50$close, 
+                   ret = g50$log.ret, hv = h50$HV20, adj.hv = h50$HV20_ghost)
+gh300 = data.frame(Date = g300$Date, Code = g300$Code, close = g50$close,
+                   ret = g300$log.ret, hv = h300$HV20, adj.hv = h300$HV20_ghost )
+rm(g50, g300, h50, h300)
+
+# Remove the first row, NA
+gh50sub = gh50[c(-1),]
+gh300sub = gh300[c(-1),]
+
+# Add sign indicator row
+s.indcr = sign(gh50sub$ret)
+gh50sub = add_column(gh50sub, s.indcr, .after = "ret")
+
+s.indcr = sign(gh300sub$ret)
+gh300sub = add_column(gh300sub, s.indcr, .after = "ret")
+rm(s.indcr)
+
+# Set Output figure size
+options(repr.plot.width = 4, repr.plot.height = 3) 
+
+```
+
+
+#### Garch Models
+```{r Garch Specialization, echo=TRUE}
+garch.spec =  ugarchspec(variance.model = list(model = "sGARCH", garchOrder = c(1, 1)),
+                            mean.model = list(armaOrder = c(0, 0)),
+                            distribution.model = "std")
+
+egarch.spec = ugarchspec(variance.model = list(model = "eGARCH", garchOrder = c(1, 1)),
+                              mean.model = list(armaOrder = c(0, 0)),
+                              distribution.model = "std")
+
+igarch.spec = ugarchspec(variance.model = list(model = "iGARCH", garchOrder = c(1, 1)),
+                        mean.model = list(armaOrder = c(0, 0)),
+                        distribution.model = "std")
+```
+
+```{r Garch Test, include=FALSE}
+# n0 = 1; n1 = 1019
+# 
+# garch.fit = ugarchfit(garch.spec, gh50sub[n0:n1,]$ret, solver = "hybrid")
+# garch.for = ugarchforecast(garch.fit, n.head = 1)
+# hv = garch.for@forecast$sigmaFor[1] * sqrt(252) * 100
+# pred.ret = garch.for@forecast$seriesFor[1]
+# hv20 = gh50sub[(n1+1),5]
+# diff = hv20 - hv
+
+```
+#### Findings
+* Garch, iGarch, eGarch 预测的对数收盘价残差(图中标注为log.return)的均值与方差一致（小数点后四位）。在峰度与偏度上面，Garch 与iGarch一致（小数点后两位）， 但是eGarch的两个数值都偏小。所以在对数收盘价的预测上，Garch与iGarch任意一个比较好
+* 三个模型预测的对数收盘价的残差都在5%之内，所以预测的准确率大致都在95%之内(有三个特异点)
+* Garch, iGarch, eGarch 预测的波动率残差的均值的差别在0.1上下；方差差别明显，其中eGarch, iGarch, eGarch的方差比另外两个模型小大致2左右。所以eGarch模型在预测收盘价上比另外两个模型好
+* 三个模型预测的波动率的残差都比真实值低3个点左右 
+* Residual plots below
+
+#### etf_50
+##### Garch
+```{r Garch Computation, include=FALSE}
+itstart = 1019; itlast = nrow(gh50sub) - 1
+it = seq.int(itstart, itlast)
+
+gar.calc = function(sub){
+  garch.fit = ugarchfit(garch.spec, gh50sub[1:sub,]$ret, solver = "hybrid")
+  garch.for = ugarchforecast(garch.fit, n.head = 1)
+  
+  hv = garch.for@forecast$sigmaFor[1] * sqrt(252) * 100
+  pred.ret = garch.for@forecast$seriesFor[1]
+  
+  ret = gh50sub[(sub+1), "ret"]
+  rdiff = abs(ret) - pred.ret
+  hv20 = gh50sub[(sub+1),"hv"]
+  hdiff = hv20 - hv
+  adj.hv20 = gh50sub[(sub+1),"adj.hv"]
+  adj.hdiff = adj.hv20 - hv
+
+  
+  want = c(pred.ret, rdiff, hv, hdiff, adj.hdiff)
+  names(want) = c("pred.ret", "ret_rsd", "hv", "hrsd", "adjhrsd")
+  want
+}
+
+diff = sapply(it, gar.calc)
+diff = t(diff) %>% as.data.frame()
+```
+
+
+```{r Garch Combine, include=FALSE}
+# Combine
+placeholder = rep(NA, 1019)
+garch.ret =  c(placeholder, diff$pred.ret)
+garch.ret.rsd =  c(placeholder, diff$ret_rsd)
+garch.hv = c(placeholder, diff$hv)
+gar.hv.rsd = c(placeholder, diff$hrsd)
+gar.adj.hv.rsd = c(placeholder, diff$adjhrsd)
+
+gh50sub = cbind(gh50sub, garch.ret, garch.ret.rsd, 
+                garch.hv, gar.hv.rsd, gar.adj.hv.rsd)
+rm(placeholder, garch.ret, garch.ret.rsd, garch.hv, gar.hv.rsd, gar.adj.hv.rsd)
+```
+
+
+```{r Garch PLot, echo=FALSE, message=FALSE, warning=FALSE}
+pdata = gh50sub[1020:nrow(gh50sub),]
+attach(pdata)
+# Plot for log return residual
+mu = mean(-s.indcr * garch.ret.rsd)
+vr = var(-s.indcr * garch.ret.rsd)
+# skwn = skewness(-s.indcr * garch.ret.rsd)
+# kur = kurtosis(-s.indcr * garch.ret.rsd)
+# c(mu, vr, skwn, kur)
+
+gar.ret.rsd.sct = pdata %>% 
+                ggplot(aes(x = Date, y = -s.indcr * garch.ret.rsd )) +
+                      geom_point(alpha = 0.5) +
+                      labs(x = "Date", y= "Residuals", 
+                           title = "Garch Log Return Residual") +
+                            theme(text = element_text(size=7))
+
+gar.ret.rsd.dist = pdata %>% 
+                    ggplot(aes(x = -s.indcr * garch.ret.rsd)) +
+                    geom_histogram() +
+                    stat_function(fun = dnorm, color = "red",
+                                  args = list(mean = mu, sd = sqrt(vr))) +
+                    labs(x = "Date", y= "Residuals", 
+                          title = "Garch Log Return Residual",
+                         subtitle = "mean: -0.00057, variance: 0.00017,
+                         skewness: 0.588, kurtosis: 6.068") +
+                            theme(text = element_text(size=7))
+  
+
+# Plot for adjusted hv residual
+mu = mean(gar.adj.hv.rsd)
+vr = var(gar.adj.hv.rsd)
+# skwn = skewness(gar.adj.hv.rsd)
+# kur = kurtosis(gar.adj.hv.rsd)
+# c(mu, vr, skwn, kur)
+
+gar.adgv.rsd.sct = pdata %>% 
+                select(Date, gar.adj.hv.rsd, gar.hv.rsd) %>% 
+                pivot_longer(cols = c(2,3), names_to = "type") %>% 
+                ggplot(aes(x = Date, y = value)) +
+                      geom_line(aes(color = type)) + 
+                      labs(x = "Date", y= "Residuals", 
+                           title = "Garch Adjusted HV20 Residual") +
+                      scale_fill_continuous(name = "Residual Type",
+                                          labels = c("Adjusted HV20", "HV20"))+
+                            theme(text = element_text(size=7))
+gar.adgv.rsd.dist = pdata %>% 
+                    ggplot(aes(x =  gar.adj.hv.rsd)) +
+                    geom_histogram() +
+                    stat_function(fun = dnorm, color = "red",
+                                  args = list(mean = mu, sd = sqrt(vr))) +
+                    labs(x = "Date", y= "Residuals", 
+                          title = "Garch Adjusted HV20 Residual",
+                         subtitle = "mean: -3.35, variance: 10.447,  
+                         skewness: -1.11, kurtosis: 5.75")+
+                            theme(text = element_text(size=7))
+
+ggarrange(gar.ret.rsd.sct, gar.ret.rsd.dist, gar.adgv.rsd.sct, gar.adgv.rsd.dist,
+          ncol = 2, nrow = 2)
+detach(pdata)
+```
+
+
+##### iGarch
+```{r iGarch Computation, message=FALSE, warning=FALSE, include=FALSE}
+itstart = 1019; itlast = nrow(gh50sub) - 1
+it = seq.int(itstart, itlast)
+
+igar.calc = function(sub){
+  igarch.fit = ugarchfit(igarch.spec, gh50sub[1:sub,]$ret, solver = "hybrid")
+  igarch.for = ugarchforecast(igarch.fit, n.head = 1)
+  
+  hv = igarch.for@forecast$sigmaFor[1] * sqrt(252) * 100
+  pred.ret = igarch.for@forecast$seriesFor[1]
+  
+  ret = gh50sub[(sub+1), "ret"]
+  rdiff = abs(ret) - pred.ret
+  hv20 = gh50sub[(sub+1),"hv"]
+  hdiff = hv20 - hv
+  adj.hv20 = gh50sub[(sub+1),"adj.hv"]
+  adj.hdiff = adj.hv20 - hv
+
+  
+  want = c(pred.ret, rdiff, hv, hdiff, adj.hdiff)
+  names(want) = c("pred.ret", "ret_rsd", "hv", "hrsd", "adjhrsd")
+  want
+}
+
+diff = sapply(it, igar.calc)
+diff = t(diff) %>% as.data.frame()
+```
+
+
+```{r iGarch Combine, include=FALSE}
+# Combine
+placeholder = rep(NA, 1019)
+igarch.ret =  c(placeholder, diff$pred.ret)
+igarch.ret.rsd =  c(placeholder, diff$ret_rsd)
+igarch.hv = c(placeholder, diff$hv)
+igar.hv.rsd = c(placeholder, diff$hrsd)
+igar.adj.hv.rsd = c(placeholder, diff$adjhrsd)
+
+gh50sub = cbind(gh50sub, igarch.ret, igarch.ret.rsd, 
+                igarch.hv, igar.hv.rsd, igar.adj.hv.rsd)
+rm(placeholder, igarch.ret, igarch.ret.rsd, igarch.hv, igar.hv.rsd, igar.adj.hv.rsd)
+```
+
+
+```{r iGarch PLot, echo=FALSE, message=FALSE, warning=FALSE}
+pdata = gh50sub[1020:nrow(gh50sub),]
+attach(pdata)
+# Plot for log return residual
+mu = mean(-s.indcr * igarch.ret.rsd)
+vr = var(-s.indcr * igarch.ret.rsd)
+# skwn = skewness(-s.indcr * igarch.ret.rsd)
+# kur = kurtosis(-s.indcr * igarch.ret.rsd)
+# c(mu, vr, skwn, kur)
+
+igar.ret.rsd.sct = pdata %>% 
+                ggplot(aes(x = Date, y = -s.indcr * igarch.ret.rsd )) +
+                      geom_point(alpha = 0.5) +
+                      labs(x = "Date", y= "Residuals", 
+                           title = "iGarch Log Return Residual")+
+                            theme(text = element_text(size=7))
+
+igar.ret.rsd.dist = pdata %>% 
+                    ggplot(aes(x = -s.indcr * igarch.ret.rsd)) +
+                    geom_histogram() +
+                    stat_function(fun = dnorm, color = "red",
+                                  args = list(mean = mu, sd = sqrt(vr))) +
+                    labs(x = "Date", y= "Residuals", 
+                          title = "iGarch Log Return Residual",
+                         subtitle = "mean: -0.00057, variance: 0.00017,
+                         skewness: 0.588, kurtosis: 6.068")+
+                            theme(text = element_text(size=7))
+  
+
+# Plot for adjusted hv residual
+mu = mean(igar.adj.hv.rsd)
+vr = var(igar.adj.hv.rsd)
+# skwn = skewness(igar.adj.hv.rsd)
+# kur = kurtosis(igar.adj.hv.rsd)
+# c(mu, vr, skwn, kur)
+
+igar.adgv.rsd.sct = pdata %>% 
+                select(Date, igar.adj.hv.rsd, igar.hv.rsd) %>% 
+                pivot_longer(cols = c(2,3), names_to = "type") %>% 
+                ggplot(aes(x = Date, y = value)) +
+                      geom_line(aes(color = type)) + 
+                      labs(x = "Date", y= "Residuals", 
+                           title = "iGarch Adjusted HV20 Residual") +
+                      scale_fill_continuous(name = "Residual Type",
+                                          labels = c("Adjusted HV20", "HV20"))+
+                            theme(text = element_text(size=7))
+igar.adgv.rsd.dist = pdata %>% 
+                    ggplot(aes(x =  igar.adj.hv.rsd)) +
+                    geom_histogram() +
+                    stat_function(fun = dnorm, color = "red",
+                                  args = list(mean = mu, sd = sqrt(vr))) +
+                    labs(x = "Date", y= "Residuals", 
+                          title = "iGarch Adjusted HV20 Residual",
+                         subtitle = "mean: -3.48, variance: 10.60,
+                         skewness: -1.13, kurtosis: 5.76")+
+                            theme(text = element_text(size=7))
+
+ggarrange(igar.ret.rsd.sct, igar.ret.rsd.dist, igar.adgv.rsd.sct, igar.adgv.rsd.dist,
+          ncol = 2, nrow = 2)
+detach(pdata)
+```
+
+##### eGarch
+```{r egarch Computation, message=FALSE, warning=FALSE, include=FALSE}
+itstart = 1019; itlast = nrow(gh50sub) - 1
+it = seq.int(itstart, itlast)
+
+egar.calc = function(sub){
+  egarch.fit = ugarchfit(egarch.spec, gh50sub[1:sub,]$ret, solver = "hybrid")
+  egarch.for = ugarchforecast(egarch.fit, n.head = 1)
+  
+  hv = egarch.for@forecast$sigmaFor[1] * sqrt(252) * 100
+  pred.ret = egarch.for@forecast$seriesFor[1]
+  
+  ret = gh50sub[(sub+1), "ret"]
+  rdiff = abs(ret) - pred.ret
+  hv20 = gh50sub[(sub+1),"hv"]
+  hdiff = hv20 - hv
+  adj.hv20 = gh50sub[(sub+1),"adj.hv"]
+  adj.hdiff = adj.hv20 - hv
+
+  
+  want = c(pred.ret, rdiff, hv, hdiff, adj.hdiff)
+  names(want) = c("pred.ret", "ret_rsd", "hv", "hrsd", "adjhrsd")
+  want
+}
+
+diff = sapply(it, egar.calc)
+diff = t(diff) %>% as.data.frame()
+```
+
+
+```{r egarch Combine, include=FALSE}
+# Combine
+placeholder = rep(NA, 1019)
+egarch.ret =  c(placeholder, diff$pred.ret)
+egarch.ret.rsd =  c(placeholder, diff$ret_rsd)
+egarch.hv = c(placeholder, diff$hv)
+egar.hv.rsd = c(placeholder, diff$hrsd)
+egar.adj.hv.rsd = c(placeholder, diff$adjhrsd)
+
+gh50sub = cbind(gh50sub, egarch.ret, egarch.ret.rsd, 
+                egarch.hv, egar.hv.rsd, egar.adj.hv.rsd)
+rm(placeholder, egarch.ret, egarch.ret.rsd, egarch.hv, egar.hv.rsd, egar.adj.hv.rsd)
+```
+
+
+```{r egarch PLot, echo=FALSE, message=FALSE, warning=FALSE}
+pdata = gh50sub[1020:nrow(gh50sub),]
+attach(pdata)
+# Plot for log return residual
+mu = mean(-s.indcr * egarch.ret.rsd)
+vr = var(-s.indcr * egarch.ret.rsd)
+# skwn = skewness(-s.indcr * egarch.ret.rsd)
+# kur = kurtosis(-s.indcr * egarch.ret.rsd)
+# c(mu, vr, skwn, kur)
+
+egar.ret.rsd.sct = pdata %>% 
+                ggplot(aes(x = Date, y = -s.indcr * egarch.ret.rsd )) +
+                      geom_point(alpha = 0.5) +
+                      labs(x = "Date", y= "Residuals", 
+                           title = "egarch Log Return Residual")+
+                            theme(text = element_text(size=7))
+
+egar.ret.rsd.dist = pdata %>% 
+                    ggplot(aes(x = -s.indcr * egarch.ret.rsd)) +
+                    geom_histogram() +
+                    stat_function(fun = dnorm, color = "red",
+                                  args = list(mean = mu, sd = sqrt(vr))) +
+                    labs(x = "Date", y= "Residuals", 
+                          title = "egarch Log Return Residual",
+                         subtitle = "mean: -0.00057, variance: 0.00017,
+                         skewness: 0.583, kurtosis: 5.99")+
+                            theme(text = element_text(size=7))
+  
+
+# Plot for adjusted hv residual
+mu = mean(egar.adj.hv.rsd)
+vr = var(egar.adj.hv.rsd)
+# skwn = skewness(egar.adj.hv.rsd)
+# kur = kurtosis(egar.adj.hv.rsd)
+# c(mu, vr, skwn, kur)
+
+egar.adgv.rsd.sct = pdata %>% 
+                select(Date, egar.adj.hv.rsd, egar.hv.rsd) %>% 
+                pivot_longer(cols = c(2,3), names_to = "type") %>% 
+                ggplot(aes(x = Date, y = value)) +
+                      geom_line(aes(color = type)) + 
+                      labs(x = "Date", y= "Residuals", 
+                           title = "egarch Adjusted HV20 Residual") +
+                      scale_fill_continuous(name = "Residual Type",
+                                          labels = c("Adjusted HV20", "HV20"))+
+                            theme(text = element_text(size=7))
+egar.adgv.rsd.dist = pdata %>% 
+                    ggplot(aes(x =  egar.adj.hv.rsd)) +
+                    geom_histogram() +
+                    stat_function(fun = dnorm, color = "red",
+                                  args = list(mean = mu, sd = sqrt(vr))) +
+                    labs(x = "Date", y= "Residuals", 
+                          title = "egarch Adjusted HV20 Residual",
+                         subtitle = "mean: -3.74, variance: 8.42,
+                         skewness: -0.24, kurtosis: 4.26")+
+                            theme(text = element_text(size=7))
+
+ggarrange(egar.ret.rsd.sct, egar.ret.rsd.dist, egar.adgv.rsd.sct, egar.adgv.rsd.dist,
+          ncol = 2, nrow = 2)
+detach(pdata)
+```
+
+
+#### etf_300
+##### Garch
+```{r 300 Garch Computation, include=FALSE}
+itstart = 1019; itlast = nrow(gh300sub) - 1
+it = seq.int(itstart, itlast)
+
+gar.calc = function(sub){
+  garch.fit = ugarchfit(garch.spec, gh300sub[1:sub,]$ret, solver = "hybrid")
+  garch.for = ugarchforecast(garch.fit, n.head = 1)
+  
+  hv = garch.for@forecast$sigmaFor[1] * sqrt(252) * 100
+  pred.ret = garch.for@forecast$seriesFor[1]
+  
+  ret = gh300sub[(sub+1), "ret"]
+  rdiff = abs(ret) - pred.ret
+  hv20 = gh300sub[(sub+1),"hv"]
+  hdiff = hv20 - hv
+  adj.hv20 = gh300sub[(sub+1),"adj.hv"]
+  adj.hdiff = adj.hv20 - hv
+
+  
+  want = c(pred.ret, rdiff, hv, hdiff, adj.hdiff)
+  names(want) = c("pred.ret", "ret_rsd", "hv", "hrsd", "adjhrsd")
+  want
+}
+
+diff = sapply(it, gar.calc)
+diff = t(diff) %>% as.data.frame()
+```
+
+
+```{r 300 Garch Combine, include=FALSE}
+# Combine
+placeholder = rep(NA, 1019)
+garch.ret =  c(placeholder, diff$pred.ret)
+garch.ret.rsd =  c(placeholder, diff$ret_rsd)
+garch.hv = c(placeholder, diff$hv)
+gar.hv.rsd = c(placeholder, diff$hrsd)
+gar.adj.hv.rsd = c(placeholder, diff$adjhrsd)
+
+gh300sub = cbind(gh300sub, garch.ret, garch.ret.rsd, 
+                garch.hv, gar.hv.rsd, gar.adj.hv.rsd)
+rm(placeholder, garch.ret, garch.ret.rsd, garch.hv, gar.hv.rsd, gar.adj.hv.rsd)
+```
+
+
+```{r 300 Garch PLot, echo=FALSE, message=FALSE, warning=FALSE}
+pdata = gh300sub[1020:nrow(gh300sub),]
+attach(pdata)
+# Plot for log return residual
+mu = mean(-s.indcr * garch.ret.rsd)
+vr = var(-s.indcr * garch.ret.rsd)
+# skwn = skewness(-s.indcr * garch.ret.rsd)
+# kur = kurtosis(-s.indcr * garch.ret.rsd)
+# c(mu, vr, skwn, kur)
+
+gar.ret300.rsd.sct = pdata %>% 
+                ggplot(aes(x = Date, y = -s.indcr * garch.ret.rsd )) +
+                      geom_point(alpha = 0.5) +
+                      labs(x = "Date", y= "Residuals", 
+                           title = "Garch Log Return Residual")+
+                            theme(text = element_text(size=7))
+
+gar.ret300.rsd.dist = pdata %>% 
+                    ggplot(aes(x = -s.indcr * garch.ret.rsd)) +
+                    geom_histogram() +
+                    stat_function(fun = dnorm, color = "red",
+                                  args = list(mean = mu, sd = sqrt(vr))) +
+                    labs(x = "Date", y= "Residuals", 
+                          title = "Garch Log Return Residual",
+                         subtitle = "mean: -0.00057, variance: 0.00017,
+                         skewness: 0.588, kurtosis: 6.068")+
+                            theme(text = element_text(size=7))
+  
+
+# Plot for adjusted hv residual
+mu = mean(gar.adj.hv.rsd)
+vr = var(gar.adj.hv.rsd)
+# skwn = skewness(gar.adj.hv.rsd)
+# kur = kurtosis(gar.adj.hv.rsd)
+# c(mu, vr, skwn, kur)
+
+gar.adgv300.rsd.sct = pdata %>% 
+                select(Date, gar.adj.hv.rsd, gar.hv.rsd) %>% 
+                pivot_longer(cols = c(2,3), names_to = "type") %>% 
+                ggplot(aes(x = Date, y = value)) +
+                      geom_line(aes(color = type)) + 
+                      labs(x = "Date", y= "Residuals", 
+                           title = "Garch Adjusted HV20 Residual") +
+                      scale_fill_continuous(name = "Residual Type",
+                                          labels = c("Adjusted HV20", "HV20"))+
+                            theme(text = element_text(size=7))
+gar.adgv300.rsd.dist = pdata %>% 
+                    ggplot(aes(x =  gar.adj.hv.rsd)) +
+                    geom_histogram() +
+                    stat_function(fun = dnorm, color = "red",
+                                  args = list(mean = mu, sd = sqrt(vr))) +
+                    labs(x = "Date", y= "Residuals", 
+                          title = "Garch Adjusted HV20 Residual",
+                         subtitle = "mean: -3.08, variance: 9.53,
+                         skewness: -0.95, kurtosis: 5.87")+
+                            theme(text = element_text(size=7))
+
+ggarrange(gar.ret300.rsd.sct, gar.ret300.rsd.dist, gar.adgv300.rsd.sct, gar.adgv300.rsd.dist,
+          ncol = 2, nrow = 2)
+detach(pdata)
+```
+
+
+##### iGarch
+```{r 300 iGarch Computation, message=FALSE, warning=FALSE, include=FALSE}
+itstart = 1019; itlast = nrow(gh300sub) - 1
+it = seq.int(itstart, itlast)
+
+igar.calc = function(sub){
+  igarch.fit = ugarchfit(igarch.spec, gh300sub[1:sub,]$ret, solver = "hybrid")
+  igarch.for = ugarchforecast(igarch.fit, n.head = 1)
+  
+  hv = igarch.for@forecast$sigmaFor[1] * sqrt(252) * 100
+  pred.ret = igarch.for@forecast$seriesFor[1]
+  
+  ret = gh300sub[(sub+1), "ret"]
+  rdiff = abs(ret) - pred.ret
+  hv20 = gh300sub[(sub+1),"hv"]
+  hdiff = hv20 - hv
+  adj.hv20 = gh300sub[(sub+1),"adj.hv"]
+  adj.hdiff = adj.hv20 - hv
+
+  
+  want = c(pred.ret, rdiff, hv, hdiff, adj.hdiff)
+  names(want) = c("pred.ret", "ret_rsd", "hv", "hrsd", "adjhrsd")
+  want
+}
+
+diff = sapply(it, igar.calc)
+diff = t(diff) %>% as.data.frame()
+```
+
+
+```{r 300 iGarch Combine, include=FALSE}
+# Combine
+placeholder = rep(NA, 1019)
+igarch.ret =  c(placeholder, diff$pred.ret)
+igarch.ret.rsd =  c(placeholder, diff$ret_rsd)
+igarch.hv = c(placeholder, diff$hv)
+igar.hv.rsd = c(placeholder, diff$hrsd)
+igar.adj.hv.rsd = c(placeholder, diff$adjhrsd)
+
+gh300sub = cbind(gh300sub, igarch.ret, igarch.ret.rsd, 
+                igarch.hv, igar.hv.rsd, igar.adj.hv.rsd)
+rm(placeholder, igarch.ret, igarch.ret.rsd, igarch.hv, igar.hv.rsd, igar.adj.hv.rsd)
+```
+
+
+```{r 300 iGarch PLot, echo=FALSE, message=FALSE, warning=FALSE}
+pdata = gh300sub[1020:nrow(gh300sub),]
+attach(pdata)
+# Plot for log return residual
+mu = mean(-s.indcr * igarch.ret.rsd)
+vr = var(-s.indcr * igarch.ret.rsd)
+# skwn = skewness(-s.indcr * igarch.ret.rsd)
+# kur = kurtosis(-s.indcr * igarch.ret.rsd)
+# c(mu, vr, skwn, kur)
+
+igar.ret300.rsd.sct = pdata %>% 
+                ggplot(aes(x = Date, y = -s.indcr * igarch.ret.rsd )) +
+                      geom_point(alpha = 0.5) +
+                      labs(x = "Date", y= "Residuals", 
+                           title = "iGarch Log Return Residual")+
+                            theme(text = element_text(size=7))
+
+igar.ret300.rsd.dist = pdata %>% 
+                    ggplot(aes(x = -s.indcr * igarch.ret.rsd)) +
+                    geom_histogram() +
+                    stat_function(fun = dnorm, color = "red",
+                                  args = list(mean = mu, sd = sqrt(vr))) +
+                    labs(x = "Date", y= "Residuals", 
+                          title = "iGarch Log Return Residual",
+                         subtitle = "mean: -0.00057, variance: 0.00017,
+                         skewness: 0.588, kurtosis: 6.068")+
+                            theme(text = element_text(size=7))
+  
+
+# Plot for adjusted hv residual
+mu = mean(igar.adj.hv.rsd)
+vr = var(igar.adj.hv.rsd)
+# skwn = skewness(igar.adj.hv.rsd)
+# kur = kurtosis(igar.adj.hv.rsd)
+# c(mu, vr, skwn, kur)
+
+igar.adgv300.rsd.sct = pdata %>% 
+                select(Date, igar.adj.hv.rsd, igar.hv.rsd) %>% 
+                pivot_longer(cols = c(2,3), names_to = "type") %>% 
+                ggplot(aes(x = Date, y = value)) +
+                      geom_line(aes(color = type)) + 
+                      labs(x = "Date", y= "Residuals", 
+                           title = "iGarch Adjusted HV20 Residual") +
+                      scale_fill_continuous(name = "Residual Type",
+                                          labels = c("Adjusted HV20", "HV20"))+
+                            theme(text = element_text(size=7))
+igar.adgv300.rsd.dist = pdata %>% 
+                    ggplot(aes(x =  igar.adj.hv.rsd)) +
+                    geom_histogram() +
+                    stat_function(fun = dnorm, color = "red",
+                                  args = list(mean = mu, sd = sqrt(vr))) +
+                    labs(x = "Date", y= "Residuals", 
+                          title = "iGarch Adjusted HV20 Residual",
+                         subtitle = "mean: -3.21, variance: 9.63,
+                         skewness: -0.98, kurtosis: 5.86")+
+                            theme(text = element_text(size=7))
+
+ggarrange(igar.ret300.rsd.sct, igar.ret300.rsd.dist, 
+          igar.adgv300.rsd.sct, igar.adgv300.rsd.dist,
+          ncol = 2, nrow = 2)
+detach(pdata)
+```
+
+##### eGarch
+```{r 300 egarch Computation, message=FALSE, warning=FALSE, include=FALSE}
+itstart = 1019; itlast = nrow(gh300sub) - 1
+it = seq.int(itstart, itlast)
+
+egar.calc = function(sub){
+  egarch.fit = ugarchfit(egarch.spec, gh300sub[1:sub,]$ret, solver = "hybrid")
+  egarch.for = ugarchforecast(egarch.fit, n.head = 1)
+  
+  hv = egarch.for@forecast$sigmaFor[1] * sqrt(252) * 100
+  pred.ret = egarch.for@forecast$seriesFor[1]
+  
+  ret = gh300sub[(sub+1), "ret"]
+  rdiff = abs(ret) - pred.ret
+  hv20 = gh300sub[(sub+1),"hv"]
+  hdiff = hv20 - hv
+  adj.hv20 = gh300sub[(sub+1),"adj.hv"]
+  adj.hdiff = adj.hv20 - hv
+
+  
+  want = c(pred.ret, rdiff, hv, hdiff, adj.hdiff)
+  names(want) = c("pred.ret", "ret_rsd", "hv", "hrsd", "adjhrsd")
+  want
+}
+
+diff = sapply(it, egar.calc)
+diff = t(diff) %>% as.data.frame()
+```
+
+
+```{r 300 egarch Combine, include=FALSE}
+# Combine
+placeholder = rep(NA, 1019)
+egarch.ret =  c(placeholder, diff$pred.ret)
+egarch.ret.rsd =  c(placeholder, diff$ret_rsd)
+egarch.hv = c(placeholder, diff$hv)
+egar.hv.rsd = c(placeholder, diff$hrsd)
+egar.adj.hv.rsd = c(placeholder, diff$adjhrsd)
+
+gh300sub = cbind(gh300sub, egarch.ret, egarch.ret.rsd, 
+                egarch.hv, egar.hv.rsd, egar.adj.hv.rsd)
+rm(placeholder, egarch.ret, egarch.ret.rsd, egarch.hv, egar.hv.rsd, egar.adj.hv.rsd)
+```
+
+
+```{r 300 egarch PLot, echo=FALSE, message=FALSE, warning=FALSE}
+pdata = gh300sub[1020:nrow(gh300sub),]
+attach(pdata)
+# Plot for log return residual
+mu = mean(-s.indcr * egarch.ret.rsd)
+vr = var(-s.indcr * egarch.ret.rsd)
+# skwn = skewness(-s.indcr * egarch.ret.rsd)
+# kur = kurtosis(-s.indcr * egarch.ret.rsd)
+# c(mu, vr, skwn, kur)
+
+egar.ret300.rsd.sct = pdata %>% 
+                ggplot(aes(x = Date, y = -s.indcr * egarch.ret.rsd )) +
+                      geom_point(alpha = 0.5) +
+                      labs(x = "Date", y= "Residuals", 
+                           title = "egarch Log Return Residual")+
+                            theme(text = element_text(size=7))
+
+egar.ret300.rsd.dist = pdata %>% 
+                    ggplot(aes(x = -s.indcr * egarch.ret.rsd)) +
+                    geom_histogram() +
+                    stat_function(fun = dnorm, color = "red",
+                                  args = list(mean = mu, sd = sqrt(vr))) +
+                    labs(x = "Date", y= "Residuals", 
+                          title = "egarch Log Return Residual",
+                         subtitle = "mean: -0.00058, variance: 0.00017,
+                         skewness: 0.584, kurtosis: 5.99")+
+                            theme(text = element_text(size=7))
+  
+
+# Plot for adjusted hv residual
+mu = mean(egar.adj.hv.rsd)
+vr = var(egar.adj.hv.rsd)
+# skwn = skewness(egar.adj.hv.rsd)
+# kur = kurtosis(egar.adj.hv.rsd)
+# c(mu, vr, skwn, kur)
+
+egar.adgv300.rsd.sct = pdata %>% 
+                select(Date, egar.adj.hv.rsd, egar.hv.rsd) %>% 
+                pivot_longer(cols = c(2,3), names_to = "type") %>% 
+                ggplot(aes(x = Date, y = value)) +
+                      geom_line(aes(color = type)) + 
+                      labs(x = "Date", y= "Residuals", 
+                           title = "egarch Adjusted HV20 Residual") +
+                      scale_fill_continuous(name = "Residual Type",
+                                          labels = c("Adjusted HV20", "HV20"))+
+                            theme(text = element_text(size=7))
+egar.adgv300.rsd.dist = pdata %>% 
+                    ggplot(aes(x =  egar.adj.hv.rsd)) +
+                    geom_histogram() +
+                    stat_function(fun = dnorm, color = "red",
+                                  args = list(mean = mu, sd = sqrt(vr))) +
+                    labs(x = "Date", y= "Residuals", 
+                          title = "egarch Adjusted HV20 Residual",
+                         subtitle = "mean: -3.74, variance: 7.14,
+                         skewness: -0.98, kurtosis: 5.86")+
+                            theme(text = element_text(size=7))
+
+ggarrange(egar.ret300.rsd.sct, egar.ret300.rsd.dist, 
+          egar.adgv300.rsd.sct, egar.adgv300.rsd.dist,
+          ncol = 2, nrow = 2)
+detach(pdata)
+```
+
+##### Combine 50 & 100
+```{r}
+garch_hv = rbind(gh50sub, gh300sub)
+tail(gh50sub, 10)  # Showing last 10 days of data of etf_50
+tail(gh300sub, 10) # Showing last 10 days of data of etf_300
+write.csv(garch_hv, "/Users/cindy/Desktop/Intern/GarchHV/garch_hv_rsd.csv", row.names = FALSE)
+```
+
+```{r}
+subset(garch_hv, abs(garch_hv$garch.ret.rsd) > 0.05)
+```
+

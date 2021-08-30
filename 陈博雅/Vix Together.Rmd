@@ -1,0 +1,594 @@
+---
+title: "Vix Together"
+---
+
+## Setup
+```{r message=FALSE, warning=FALSE}
+library(dplyr)
+library(data.table)
+library(tibble)
+library(tidyr)
+library(arrow)
+library(purrr)
+# source("Vix_Functions.R")
+```
+
+## 需要手动输入的信息
+```{r 需要手动输入的信息}
+read_path = "/Users/cindy/Desktop/Intern/Data/202105PRim"
+writePath = "/Users/cindy/Desktop/Intern/Data/Vix/ETF50/"
+
+# 三选一 "510050" "510300" or "000300"
+type = "510050"
+
+# 勿改, sql用
+shIze = paste(type %>% as.character(), ".SH", sep ="")
+case = ifelse(type == "000300", "index", "etf")
+
+```
+
+
+```{r db connection, message=FALSE, warning=FALSE, include=FALSE}
+library(DBI)
+con <- DBI::dbConnect(odbc::odbc(), Driver = "ODBC Driver 17 for SQL Server", 
+    Server = "192.168.9.85", Database = "Option", UID = "sa", 
+    PWD = "lhtzb.123", Port = 1433)
+```
+
+```{r Data interest Rate import}
+## Read interest Rate Data
+rf = dbReadTable(con, Id(schema = "dbo", name = "rf"))
+colnames(rf) = c("date", "rate")
+rf$date = as.Date(rf$date, format = "%Y-%m-%d")
+rf$risk = log( 1 + (rf$rate / 100))
+```
+
+```{sql Contract Info, connection = con, output.var = cdi}
+select "日期", "期权代码","交易代码","行权价","前结算价","收盘价","结算价","认购认沽","上市日","到期日"
+from contract_info_daily
+where "期权标的" = ?shIze
+```
+```{r cdi Processing}
+colnames(cdi) = c("date", "symbol", "trading_code", "strike_prc", "prev_setl_prc", "close",
+                  "setl.prc","callput", "effective_date", "expire_date")
+cdi = cdi %>%  
+  mutate(callput = ifelse(callput == "认购", "c", "p"))
+
+```
+
+```{sql Contract Info, connection = con, output.var = cdi_index}
+select "期权代码","行权价","上市日", "到期日"
+from contract_info_300index
+```
+```{r cdi_index Processing}
+colnames(cdi_index) = c("trading_code", "strike_prc", "effective_date", "expire_date")
+```
+```{sql 300index Daily, connection = con, output.var = daily_300}
+select "日期","期权代码","前结算价"
+from 日行情_300index
+```
+```{r 300index Daily}
+colnames(daily_300) = c("date", "trading_code", "prev_setl_prc")
+```
+
+## Functions
+```{r}
+
+# Read Minbar Data from read_path, compute vix and core vix, write as csv files to write_path
+# @param {character} the path to read data from
+# @param writepath {character} the path to write processed data to; 
+#           if the path is to a folder, must add "/" to the end
+# @param case {character} one of "etf" or "index"
+# @param type {character} underlying code, one of "510050", "510300" or "000300"
+Vix = function(read_path, write_path, case, type){
+  om = list.files(read_path, recursive = FALSE, full.names = TRUE)
+  ivc = lapply(om, function(t){
+    i1 = readOne(t, case, type)
+    i2.1 = PrepareDf(i1, case)
+    # Index 300 Skip ChangeProbAB
+    if(case == "etf"){i2.1 = ChangeProbAB(i2.1)}
+    i2.3 = FillPrice(i2.1)
+    i2.4 = ProcessOd(i2.3, case)
+    i2.5 = getCmbOdSig(i2.4, case)
+    iv1 = i2.5[,1:4] %>% getOdVix() %>% data.frame() %>%  setDT(keep.rownames = TRUE)
+    iv2 = i2.5[,5:8] %>% getOdVix() %>% data.frame() %>%  setDT(keep.rownames = FALSE)
+    ivc = cbind(iv1, iv2)
+    colnames(ivc) = c("datetime", "Vix", "Core_Vix")
+    return(ivc)
+  })
+  
+  print("Start Writing")
+  lapply(ivc, WriteVix, write_path = write_path)
+  print("Writing Finished")
+}
+
+
+
+# —————————————————— Read Data ——————————————————————————
+# Read Minbar Data，一天整天的数据合并为一个dataframe, where stock price is read separtely and appended at the end
+# @param path {character} path to the data, we want to import, assume data is minbar data from datahouse
+# @param case {character scalar} the input data type, either "etf" or "index". [default = "etf"]
+# @param sh_code {character scalar} the underlying code. One of "510050" "510300" or "000300" (i.e. type variable defined at the beginning)
+# @return: {dataframe} dataframe with selected data -- see col_select, as well as the minute stock data appended at the end 
+readOne = function(path, case = "etf", sh_code){
+  if(case == "etf"){
+    od = list.files(path, recursive = TRUE,full.names = TRUE, pattern = "^sh_1000") %>%
+      lapply(function(f)
+        read_parquet(f, col_select = c("symbol","datetime", "close", "volume",
+                                       "first_ask_prc1", "first_ask_vol1", "first_ask_vol2",
+                                       "first_ask_vol3", "first_ask_vol4", "first_ask_vol5",
+                                       "first_bid_prc1", "first_bid_vol1", "first_bid_vol2",
+                                       "first_bid_vol3", "first_bid_vol4", "first_bid_vol5"))) %>%
+      rbindlist(use.names = TRUE) %>%
+      arrange(datetime) %>% 
+      mutate(symbol = as.numeric(substr(symbol, 1, 8)))
+
+  } else {
+    od = list.files(path, recursive = TRUE, full.names = TRUE, pattern = "^cfe_io")%>%
+      lapply(function(f)
+        read_parquet(f, col_select = c("symbol", "datetime", "open", "close", "volume",
+                                       "first_ask_prc1", "first_bid_prc1"))) %>%
+      rbindlist(use.names = TRUE) %>%
+      arrange(datetime) %>%
+      mutate(callput = symbol %>% substr(8,8) %>% tolower(),
+             symbol = substr(symbol, 1, 13))
+  }
+  
+  sh_code = paste("sh_", sh_code, sep = "")
+  od2 = list.files(path, recursive = TRUE,full.names = TRUE, pattern = type)
+  if(length(od2) > 1) {message("Error! More than one stock price"); stop()}
+  od2 = od2 %>% read_parquet(col_select = c("datetime", "open"))
+  colnames(od2) = c("datetime", "stock_prc")
+  
+  od = merge(od, od2, by = "datetime")
+  return(od)
+} 
+
+
+# —————————————————— Vix Helper Function ——————————————————————————
+
+# Combine Minbar Data & contract daily info to extract and process relavent info such as strike price, expire_mins etc
+# Note: cdi & cdi_index are obtained through pulls from sql server 
+# @param od {dataframe} usually an output of readOne(). 
+#           Merge with cdi on columns "date" and "symbol" on case "etf"; "symbol" on case "index"
+# @[UNSED]param cdi {dataframe} daily contract info pulled from sql database.
+#           Merge with od on columns "date" and "symbol" on case "etf"; "trading_code" on case "index"
+#           case "etf" use cdi; case "index" use cdi_index
+# ASSUMED TO EXIST AS IT IS PULLED FROM SQL SERVER
+# @param case {character scalar} either "etf" or "index" [default = "etf"]
+# @return {dataframe} with merged data, and expired_mins calculated
+PrepareDf = function(od, case= "etf"){
+  if(case == "etf"){
+    od$datetime = as.POSIXct(od$datetime, tz = "UTC")
+    cdiOD = cdi %>%  subset(as.Date(cdi$date) %in% unique(as.Date(od$datetime)))
+    
+    od = od %>% mutate(date = as.Date(datetime))
+    cdiOD$date =  as.Date(cdiOD$date)
+    
+    test = merge(od, cdiOD, by= c("date","symbol")) %>% rowwise() %>% 
+      mutate(close.x = ifelse(is.na(close.x), prev_setl_prc, close.x)) %>% 
+      group_by(symbol) %>%
+      mutate(pre_close_prc = c(head(prev_setl_prc,1), head(close.x, -1))) %>% ungroup() %>% 
+      select(-c(date, close.x, prev_setl_prc)) %>% 
+      arrange(datetime) %>% 
+      dplyr::filter(!is.na(trading_code)) %>% 
+      mutate(trading_code = substr(trading_code, 8, 17)) %>% 
+      mutate(expire_mins = difftime(expire_date, datetime, units = "mins")) %>% 
+      select(-c(effective_date, expire_date))
+    
+    test$expire_mins = test$expire_mins %>% as.numeric()
+  } else {
+    test = merge(od, cdi_index, by.x = "symbol", by.y ="trading_code",
+                 all.x = TRUE, all.y = FALSE) %>% 
+      mutate(trading_code = substr(symbol, 3, 6)) %>% 
+      mutate(expire_mins = difftime(expire_date, datetime, units = "mins"),
+             first_ask_prc1 = ifelse(is.na(first_ask_prc1), 0, first_ask_prc1),
+             first_bid_prc1 = ifelse(is.na(first_bid_prc1), 0, first_bid_prc1)) %>% 
+      select(-c(effective_date, expire_date)) %>% 
+      relocate(trading_code, .before = close)
+    
+    od1 = test
+    daily_300$date = daily_300$date %>% as.character()
+    od1$date = od1$datetime %>% as.character() %>% substr(1,10)
+    
+    od1 = merge(od1, daily_300, by.x = c("date", "symbol"), by.y = c("date", "trading_code"),
+                all.x = TRUE, all.y = FALSE) %>% select(-date) %>% group_by(symbol) %>% nest()
+    
+    od1[[2]] = lapply(od1[[2]], function(t){
+      pre_close_prc = c(t$prev_setl_prc[1], t$close[2:239])
+      t = cbind(t, pre_close_prc)
+    })
+    test = unnest(od1) %>% select(-c(prev_setl_prc, open, close))
+    
+    test$expire_mins = test$expire_mins %>% as.numeric()
+  }
+  return(test)
+}
+
+# Change Problematic data in the datafram -- replace price to 0
+# @param df {dataframe} must contain columns: first_ask_prc1, first_bid_prc1, first_ask_vol 1 ~ 5, first_bid_vol 1 ~ 5
+# @return {dataframe} chenge problem ask/bid price to 0
+ChangeProbAB = function(df){
+  ot1 = df %>% mutate(first_ask_prc1 = ifelse(IsProb(first_ask_prc1, first_ask_vol1, 
+                                                     first_ask_vol2, first_ask_vol3, 
+                                                     first_ask_vol4, first_ask_vol5),
+                                              0, first_ask_prc1),
+                      first_bid_prc1 = ifelse(IsProb(first_bid_prc1, first_bid_vol1, 
+                                                     first_bid_vol2, first_bid_vol3, 
+                                                     first_bid_vol4, first_bid_vol5), 
+                                              0, first_bid_prc1))
+  return(ot1)
+}
+
+# Helper of ChangeProbAB
+# Check if a single set of data is problematic
+# Helper of ChangeProbAB
+# @param prc1 {numeric scalar} price
+# @param v_i {numeric scalar} volume
+# @return: {boolean}
+IsProb = function(prc1, v1, v2, v3, v4, v5){
+  cond1 = ((v2 + v3 + v4 + v5) > 0)
+  cond2 = (v1 == 0)
+  condN1 = cond1 & cond2
+  
+  cond1 = ((v1 + v2 + v3 + v4 + v5) == 0)
+  cond2 = (prc1 != 0) 
+  condN2 = cond1 & cond2
+  return(condN1 | condN2)
+}
+
+# Fill in the price for 合约
+# @param df {dataframe} usually the returned df for changeProbAB(),
+# @return {dataframe} fill in the price following the rules in "上证50 ETF 波动率指数编制方案" with modification to transform unit to minute
+FillPrice = function(df){
+  nosold = FillNosold(df)
+  sold = Fillsold(df)
+  od = rbind(nosold,sold)
+  return(od) 
+}
+
+# Helper of FillPrice
+# Fill in the price for 无成交合约
+# @param df {dataframe} subset of input df in FillPrice -- see specification for FillPrice
+# @return {dataframe} fill in the price following the rules in "上证50 ETF 波动率指数编制方案" with modification to transform unit to minute
+FillNosold = function(df){
+  test1 = df %>% arrange(volume)
+  nsubset = length(test1$volume[test1$volume == 0])
+  nosold = test1[1:nsubset,] %>% 
+    mutate(price = ifelse(first_bid_prc1 == 0, 
+                          ifelse(first_ask_prc1 == 0, pre_close_prc, 
+                                 min(first_ask_prc1, pre_close_prc)),
+                          ifelse(first_ask_prc1 == 0, max(pre_close_prc, first_bid_prc1), 
+                                 (first_ask_prc1 + first_bid_prc1)/2)))
+  return(nosold)
+}
+
+# Helper of FillPrice
+# Fill in the price for 成交合约
+# @param df {dataframe} subset of input df in FillPrice -- see specification for FillPrice
+# @return {dataframe} fill in the price following the rules in "上证50 ETF 波动率指数编制方案" with modification to transform unit to minute
+Fillsold = function(df){
+  test1 = df %>% arrange(volume)
+  nsubset = length(test1$volume[test1$volume == 0])
+  sold = test1[(nsubset+1):nrow(test1),] %>% 
+    mutate(price = ifelse(first_bid_prc1 == 0, 
+                          ifelse(first_ask_prc1 == 0, pre_close_prc, 
+                                 min(first_ask_prc1, pre_close_prc)),
+                          ifelse(first_ask_prc1 == 0, max(pre_close_prc, first_bid_prc1), 
+                                 ifelse(checkRange(pre_close_prc, first_bid_prc1, first_ask_prc1),
+                                        pre_close_prc, 
+                                        (first_bid_prc1 + first_ask_prc1)/2))))
+  return(sold)
+}
+
+# Helper of Fillsold <- FillPrice
+# Check x 是否在 rb1 与 rb2 之间
+# @param x {numeric scalar} the target value 
+# @param rb1, rb2 {numeric scalar} the lower and upper bound
+# @return: {boolean} 
+checkRange = function(x, rb1, rb2){
+  return(( (rb1 <= x) &  (x <= rb2)) | ( (rb2 <= x) & (x <= rb1)) )
+}
+
+# Tidy, cleanup and simplify the input data
+# @param df {dataframe} must contain columns: datetime, trading_code, callput, strike_prc, expire_mins, symbol, first_ask_prc1, first_bid_prc1
+# @param case {character} either "etf" or "index" [default = "etf"]
+# @return {dataframe} with columns datetime, trading_code, stock_prc, strike_prc, callput, price, expire_mins, symbol, absdif
+ProcessOd = function(df, case = "etf"){
+  if(case == "etf") {
+    od = df %>% select(symbol, datetime, trading_code, stock_prc, strike_prc, callput, expire_mins, price)
+    
+    od = od %>% group_by(trading_code, datetime) %>% 
+      arrange(datetime) %>% 
+      mutate(absdiff = rep(abs(diff(price)),2)) %>% ungroup() %>% 
+      arrange(datetime, trading_code, callput)
+  } else {
+    ## Bacause The trading code here does not uniquely define a callput pair, here create one for it
+    od = df %>% mutate(trad_id = paste(substr(symbol, 1, 6), substr(symbol, 9, 13), sep = "")) %>% 
+      group_by(trad_id, datetime) %>% 
+      arrange(datetime) %>% 
+      mutate(absdiff = rep(abs(diff(price)), 2)) %>% ungroup() %>% 
+      select(symbol, datetime, trading_code, stock_prc, strike_prc, callput, expire_mins, price, absdiff) %>% 
+      arrange(datetime, strike_prc, callput)
+  }
+  return(od)
+}
+
+
+# Calculate one day's sigma value (normal + Core)
+# @param df {dataframe} with columns datetime, trading_code, stock_prc, strike_prc, callput, price, expire_mins, symbol, absdif 
+#           usually an output of ProcessOd
+# @param case {character scalar} either "etf" or "index" [default = "etf"]
+# @return {dataframe} with calculated Volatility for every datetime {sig1, sig2, T1, T2, sig1c, sig2c, T1c, T2c}
+getCmbOdSig = function(df, case = "etf"){
+  unqTime = unique(as.character(df$datetime)) 
+  sigP = sapply(unqTime, getCmbSigPair, od = df, case = case)
+  sigP = sigP %>% t()
+  colnames(sigP) = c("sig1","sig2", "T1", "T2", "sig1c", "sig2c", "T1c", "T2c")   
+  rownames(sigP) = unqTime 
+  return(sigP)
+}
+
+# For a given datetime, calculate the near-term & next-term sigma squared value (Normal + Core)
+# @param od {dataframe} with columns datetime, trading_code, stock_prc, strike_prc, callput, price, expire_mins, symbol, absdif 
+#           usually an output of ProcessOd
+# @param tim {character scalar} datetime {yyyy-mm-dd HH:MM:SS}
+# @param case {character scalar} either "etf" or "index" [default = "etf"]
+# @return {numeric(2)} sigma/volatility for near-term & next-term options, respectively 
+getCmbSigPair = function(od, tim, case = "etf"){
+  
+  test = subset(od, as.character(od$datetime) == tim)
+  R = FindR(test)
+  Tmin = FindTmin(test)
+  
+  sep = SeparateRX(test, Tmin)
+  testNR = sep[[1]]
+  testNX = sep[[2]]
+  
+  # Core filtering
+  testNRc = getCore(testNR)
+  testNXc = getCore(testNX)
+  
+  # Creating Lists of terms and time to expiry
+  term = list(testNR = testNR, testNX = testNX, testNRc = testNRc, testNXc = testNXc)
+  Tmin = rep(Tmin, 2) %>% as.list()
+  SF = map2(term, Tmin, .f = FindSF, R = R)
+  term = lapply(term, cleanup, case = case)
+  K0s = map2(term, SF, .f = function(t, sf){Findk0(t, sf[2])})
+  term = lapply(term, function(t){
+    t = t %>% arrange(strike_prc, decreasing = FALSE)
+    t$Ki = sort(t$strike_prc, decreasing = FALSE)
+    t$detKi = FindDetKi(t$Ki)
+    return(t)
+  })
+  term = map2(term, K0s, .f = FindPki)
+
+  ls = list(term, Tmin, SF, K0s)
+  sig = pmap(ls, .f = FindSig2, R = R)
+  
+  ret = c(sig[[1]] %>% sqrt(), sig[[2]] %>% sqrt(), Tmin[[1]], Tmin[[2]], 
+          sig[[3]] %>% sqrt(), sig[[4]] %>% sqrt(), Tmin[[3]], Tmin[[4]])
+  
+  return(ret)
+}
+
+# Helper of GetCmbSigPair <- GetCmbOdSig
+# Extract the continuous annual interest rate from rf
+# Note: Assume rf is pulled from sql server already
+# @param df {dataframe} with column datetime
+# @return {numeric(1)} the target interst rate
+FindR = function(df){
+  today = as.Date(df$datetime[1], format = "%Y-%m-%d")
+  R = subset(rf, rf$date == today)$rate
+  return(R)
+}
+
+# Helper of GetCmbSigPair <- GetCmbOdSig
+# Find time to expiry for both near-term & next-term option (select near & next term options' expiry time)
+# @param df {dataframe} with columns expire_mins; the dataframe with all option information for a specific datetime
+# @return {numeric(2)} the time to expiry for near-term and next-term option
+FindTmin = function(df){
+  N365 = 60*24*365
+  day8min = 60*24*7
+  Tfa = unique(df$expire_mins) %>% sort(decreasing = FALSE)
+  Tfa = Tfa[Tfa > day8min] %>% head(2)
+  return(Tfa/N365)
+}
+
+# Helper of GetCmbSigPair <- GetCmbOdSig
+# Subset and separate near-term & next term option from dataframe df based on the time to expiry information in Tmin
+# @param df {dataframe} with column expire_mins and strike_prc; dataframe containg option information at one datetime
+# @param Tmin {numeric(2)} vector containing time to expiry for near-term and next-term option
+# @return {named list(2)} a list with near-term & next-term options as two separate dataframes
+SeparateRX = function(df, Tmin){
+  m365 = 60*24*365
+  nr = df %>% subset((df$expire_mins /m365) == (Tmin[1]))
+  nx = df %>% subset((df$expire_mins /m365) == (Tmin[2]))
+  return(list(nr,nx))
+}
+
+# Helper of GetCmbSigPair <- GetCmbOdSig
+# Subset the Core (the pair of options with strike price cloest to the current stock price) near-term & next-term options
+# @param df {dataframe} usually an output of ProcessOd
+# @return {dataframe} filtered df that only contain the core 4 options
+getCore = function(df){
+  
+  strike = df %>% mutate(absS = strike_prc - stock_prc) %>% arrange(absS, trading_code, callput)
+  
+  upb = strike %>% subset(strike$absS >= 0)
+  lwb = strike %>% subset(strike$absS < 0)
+  
+  upb = upb %>% arrange(absS, trading_code, callput) %>% slice(1:(2*2)) %>% select(-absS)
+  lwb = lwb %>% arrange(absS, trading_code, callput) %>% slice((nrow(lwb) - (2*2 -1)): nrow(lwb)) %>% select(-absS)
+  
+  if(nrow(upb) < 2) {print(paste("上两档不足", nrow(upb)))}
+  if(nrow(lwb) < 2) {print(paste("上两档不足", nrow(lwb)))}
+  
+  df = rbind(upb,lwb)
+  return(df)
+}
+
+# Helper of GetCmbSigPair <- GetCmbOdSig
+# Find the option with the smallest absolute difference in its callput mid price and calculate its corresponding forwarding price
+# @param df {dataframe} with columns call_bid, put_bid, absdiff, call_midQ, put_midQ
+# @param Tmin {numeric(1)} the time to expiry corresponding to this term
+# @param R {numeric(!)} the annual continuous intere rate
+# @return {numeric(2)} vector with target option's strike and strike's corresponding forward price
+FindSF =  function(df, Tmin, R){
+  tib = subset(df, df$absdiff == min(df$absdiff))
+  S = tib$strike_prc[1]
+  Fa = S + (exp(R * Tmin)) * (-diff(tib$price))
+  return(c(S, Fa))
+}
+
+# Helper of GetCmbSigPair <- GetCmbOdSig
+# Combine callput information togather to one row
+# @param df {dataframe} with column" trading_code, callput, strike_prc, stock_prc, price
+# @param case {character scalar} either "etf" or "index" [default = "etf"]
+# @return {dataframe} the input df with values unchanged but organized differently.
+cleanup = function(df, case = "etf"){
+  if(case == "etf"){
+    cpPrc = df %>% arrange(datetime) %>% 
+      pivot_wider(id_cols = c(trading_code, stock_prc), names_from = callput, values_from = price) %>% 
+      arrange(trading_code) 
+    n = nrow(df)/2
+    df = df %>% arrange(callput)
+    df = df[1:n,] %>% arrange(trading_code) %>% 
+      select(-c(callput))
+    df = merge(df, cpPrc, by = "trading_code")
+  } else {
+    df = df %>% mutate(trad_id = paste(substr(symbol, 1, 6), substr(symbol, 9, 13), sep =""))
+    cpPrc = df %>% arrange(datetime) %>% 
+      pivot_wider(id_cols = c(trad_id, stock_prc), names_from = callput, values_from = price) %>% 
+      arrange(trad_id)
+    n = nrow(df)/2
+    df = df %>% arrange(callput)
+    df = df[1:n,] %>% arrange(trad_id) %>% 
+      select(-c(callput))
+    df = merge(df, cpPrc, by = "trad_id") %>% select(-trad_id)
+  }
+  
+  return(df)
+}
+
+# Helper of GetCmbSigPair <- GetCmbOdSig
+# Find K0, the strike price that is not only smaller than F and but also closest to F
+# @param df {dataframe} with column strike_prc; dataframe containing this term's option information.
+# @param Fa {numeric(1)} the forward price to be compared with
+# @return {numeric(1)} the strike price with are trying to find
+Findk0 = function(df, Fa){
+  strk_prc = df$strike_prc
+  k01 = strk_prc[strk_prc < Fa]
+  k01 = sort(k01, decreasing = TRUE)[1]
+  return(k01)
+}
+
+# Helper of GetCmbSigPair <- GetCmbOdSig
+# Compute the change in strike price
+# @param Ki {numeric vector} a term's option strike price ordered from the smallest to the biggest
+# @return {numeric vector} vector of the same length of Ki.
+FindDetKi = function(Ki){
+  n = length(Ki)
+  
+  if(n == 0){print("length of Ki is 0"); return()}
+  if(n == 1){print("length of Ki is 1");return(0)}
+  if (n == 2){print("length of Ki is 2");return(rep(Ki[2]-Ki[1],2))}
+  
+  Kp = Ki[3:n]
+  Km = Ki[1:(n-2)]
+  det = (Kp - Km)/2
+  s = Ki[2] - Ki[1]
+  e = Ki[n] - Ki[n-1]
+  return(c(s,det,e))
+}
+
+
+# Helper of GetCmbSigPair <- GetCmbOdSig
+# Decide which price to use based on the vix manual
+# 寻找填充P(ki), 
+# 若Ki⼩于K0，为Ki对应的认沽期权价格；
+# 若Ki⼤于K0，为Ki对应的认购期权价格；
+# 若Ki等于K0，为Ki对应的认沽期权价格与认购期权价格均值
+# @param df {datafram} with columns Ki, put_midQ, call_midQ
+# @param k0 {numeric(1)} the strike price that is not only smaller than F and but also closest to F
+FindPki = function(df, k0){
+  df = df %>% mutate(pki = ifelse(Ki < k0, p, ifelse(Ki > k0, c, (c+p)/2)))
+  return(df)
+}
+
+# Compute the sigma/volatitlity squared
+# @param df {dataframe} must contain columns detKi, Ki, pki
+# @param Tmin {numeric} minute-time to expire date, unit: year
+# @param R {numeric} continuous annual interest rate
+# @param SF {numeric(2)} the strike of the pair of options with minimum callput difference and its corresponding forward price; 
+#           usually an output of FindSF
+# @param K0 {numeric} the K0 parameter, usually an output of Findk0
+# @return {numeric} the volatility (squared) of the input term
+FindSig2 = function(df, Tmin, R, SF, K0){
+  p1 = 2/Tmin
+  p2.1 = df$detKi/((df$Ki)^2) * exp(R*Tmin) * df$pki
+  p2 = sum(p2.1)
+  p3 = 1/Tmin * (SF[2]/K0 -1)^2
+  x = p1*p2 - p3
+  return(x)
+}
+
+# Compute Vix value for one day
+# @param df {dataframe or matrix} formatted {near term volatility, next term volatility, near term time to expiry, next term time to expiry}
+# @return {dataframe} with calculated vix for every datetime
+getOdVix = function(df){
+  unqTime = rownames(df)
+  it = 1:(nrow(df))
+  vix = sapply(it, getVix, df = df)
+  
+  # Add timestamp 
+  vix = t(vix)
+  colnames(vix) = unqTime
+  vix = t(vix)
+  
+  today = unqTime[1] %>% substr(1,10)
+  print(paste(today, "Finished"))
+  return(vix)
+}
+
+# Compute Vix Value for a single datetime
+# @param df {dataframe or matrix} formatted {near term volatility, next term volatility, near term time to expiry, next term time to expiry}
+# @param it {numeric scalar} the number it-th minute after open [1:239]
+# @return {dataframe} with calculated vix for the datetime corresponding to it
+getVix = function(df,it){
+  x = df[it,]
+  s1 = x[1]; s2 = x[2]; t1 = x[3]; t2 = x[4]
+  n365 = 60*24*365; n30 = 60*24*30; nt1 = t1*n365; nt2 = t2*n365
+  
+  if (nt1 > n30) {
+    s1 * 100
+  } else {
+    vp1.1 = t1*(s1^2) * ( (nt2 - n30) / (nt2 - nt1) )
+    vp1.2 = t2*(s2^2) * ( (n30 - nt1) / (nt2 - nt1) )
+    vp1 = vp1.1 + vp1.2
+    vix = sqrt(vp1 * (n365/n30)) * 100
+    vix
+  }
+}
+
+# —————————————————— Write Data ——————————————————————————
+
+# Write datafram df to write_path
+# @param df {dataframe} with column datetime, Vix , Core vix
+# @param write_path {character} the write path. must contain the folder separation symbol at the end
+WriteVix <- function(df, write_path) {
+  date = as.Date(head(df$datetime,1)) %>% as.character()
+  date = gsub("-", "", date)
+  path = paste(write_path,date, ".csv", sep = "")
+  write.csv(df, path, row.names = FALSE)
+}
+
+```
+
+
+## Main
+```{r Main}
+# 所有之前的 chunk 必须跑一遍
+Vix(read_path, writePath, case, type)
+```
+

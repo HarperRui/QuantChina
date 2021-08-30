@@ -1,0 +1,320 @@
+---
+title: "Garch Family"
+---
+
+```{r Setup, message=FALSE, warning=FALSE}
+library(DBI)
+library(odbc)
+library(tseries)
+library(rugarch)
+library(PerformanceAnalytics)
+library(ggplot2)
+library(tibble)
+library(dplyr)
+library(DataCombine)
+library(purrr)
+library(data.table)
+library(rlist)
+# source("garch_func.R")
+```
+
+```{r Functions}
+# ———————————————— GARCH Wrapper Function _______________________
+# Compute garch model parameters, fit and next-day prediction by directing pulling "ohlc" data from the sql server
+# @param model {chharacter} specify the garch model we are trying to generate
+#             one of "sGARCH" [i.e. Garch], "eGARCH" , "iGARCH", default = "all"
+# @param distribution {character} specify the garch model distribution.
+#                   one of "norm" [normal distribution] and "std" [student t distribution], default = "all"
+# @param type {character} the SH code for option, one of "510050", "510300", "000300"   
+#             If not specified, pull all three option data
+# @return {dataframe} with columns Date, Code (510050.SH, 510300.SH), colse, and garch model related values, formatting "{model}.{dist}.{parameter/fit/pred}"
+compute_garch <- function(model = "all", distribution = "all", type = "all") {
+  con = connect()
+  specs = generate_spec(model, distribution)
+  price_data = import_close(type)
+  # Test, cut data short to save time
+  price_data = lapply(price_data, function(df){df = slice(df, 1:150); return(df)})
+  computed = garch(price_data, specs)
+  return(computed)
+}
+
+# Update Garch model based on the new close value
+update_garch <- function() {
+  prev = import_garch()
+  com = compute_new_garch(prev)
+  com1 = combine_update(prev, com)
+  update_db(com1)
+}
+
+# ———————————————— Import Data _______________________
+# Connect to the SQL sever 
+# @retrun a pointer to the connection
+connect <- function() {
+  con = DBI::dbConnect(odbc::odbc(),
+                       Driver   = "ODBC Driver 17 for SQL Server",
+                       Server   = "192.168.9.85",
+                       Database = "Option",
+                       UID      = "sa",
+                       PWD      = "lhtzb.123",
+                       Port     = 1433)
+  return(con)
+}
+
+# TODO: add 300 index back
+# Pull daily option close price from the sql server and process them into xts format for model fitting
+# @param type {character} the SH code for option, one of "510050", "510300", "000300"   
+#             If not specified, pull all three option data
+# @param version {character} the either "compute" or "update"; default = "compute"
+#               if "compute", extract ohlc data as it has close value from an earlier time than that of etf
+#               if "update", extract etf data as it is most up to date
+# @retrun {named list} of dataframes of processed data
+# Note: assume the the sql connection con already loaded in global environment
+import_close <- function(type = "all", version = "compute") {
+  if (type == "all") {type = list("510050", "510300")}
+  type = as.list(type)
+  extract_dataset <- function(type) {
+    if(version == "compute"){
+      dataset = switch (type,
+                        "510050" = tbl(connect(), "etf_50_ohlc") %>% select(Date, close) %>% as.data.frame() %>% return(),
+                        "510300" = tbl(connect(), "etf_300_ohlc") %>% select(Date, close) %>% as.data.frame() %>% return(),
+                        # "000300" = {temp = tbl(connect(), "日行情_300index") %>% select(日期,收盘价) %>% as.data.frame();
+                        #   colnames(temp) = c("Date", "close"); return(temp)}  
+      )
+    } else {
+      dataset = switch(type,
+                       "510050" = tbl(connect(), "etf_50") %>% select(日期, close) %>% as.data.frame(),
+                       "510300" = tbl(connect(), "etf_300") %>% select(日期, close) %>% as.data.frame(),
+                       )
+      colnames(dataset) = c("Date", "close")
+      return(dataset)
+    } 
+  }
+  close_data = lapply(type, extract_dataset)
+  # Tranform data to an xts object & calculate return
+  close_data = lapply(close_data, function(t){
+                    t = t %>% mutate(log_return = Return.calculate(price = xts(x = close, order.by = as.Date(Date), method = "log")))
+                    return(t)})
+  names(close_data) = type %>% unlist()
+  return(close_data)
+}
+
+# Pull the current version of garch data from the sql server; server info stored in connect(), data table name is assumed to be "etf_garch"
+# @return {named list} of dataframe of length n, where n is the number of option data in the table
+import_garch <- function() {
+  ref_garch <- tbl(connect(), "etf_garch") %>% as.data.frame()
+  # identify and separate code information
+  ref_garch <- split(ref_garch, as.factor(ref_garch$Code))
+  names(ref_garch) <- gsub(".{3}$", "",names(ref_garch))
+  
+  return(ref_garch)
+}
+
+# ———————————————— Garch Model Compute _______________________
+# Compute the garch model fit, parameters and next-day prediction for all model specificaiton specs for each dataframe in list dated_close
+# @param dated_close {named list dataframe} with each dataframe reprsent a stock
+# @param specs {named list S4} with model specifications we want to compute
+# @return {dataframe} with columns Date, Code (510050.SH, 510300.SH), colse, and garch model related values, formatting "{model}.{dist}.{parameter/fit/pred}"
+garch <- function(dated_close, specs) {
+  # Fit Garch model for model specifications spec and data df
+  test1 = ls_garch_fit(dated_close, specs)
+  
+  # Append the 100 NA rows before the data as a placeholder
+  test3 = map2(dated_close, test1, .f = function(date_df, model_df){
+    place_holder <- matrix(nrow = 100, ncol = ncol(model_df)) %>% as.data.frame()
+    name = names(model_df)
+    model_df <- rbind(place_holder, model_df, use.names = FALSE)
+    names(model_df) = name
+    model_df$Date <- date_df$Date
+    model_df$close <- date_df$close
+    model_df <- model_df %>% relocate(Date, .before = 1) %>% relocate(close, .after = Date)
+    return(model_df)
+  })
+  
+  # Combine list of datafram to produce one single dataframe
+  names(test3) <- paste(names(test3), ".SH", sep = "")
+  test3 = test3 %>% rbindlist(use.names = TRUE, idcol = TRUE) %>% arrange(Date)
+  test3 = rename(test3, Code = .id) %>% 
+    relocate(Code, .after = Date)
+  
+  return(test3)
+}
+
+# Generate Garch Model Specificcation
+# @param model {chharacter} specify the garch model we are trying to generate
+#             one of "sGARCH" [i.e. Garch], "eGARCH" , "iGARCH", default = "all"
+# @param distribution {character} specify the garch model distribution.
+#                   one of "norm" [normal distribution] and "std" [student t distribution], default = "all"
+# @return {list} of garch model specification, with the naming format: "{model}.{distribution}.spec"
+generate_spec <- function(model = "all", distribution = "all") {
+  # Process input into two equal-length list
+  if (distribution == "all") {distribution = list("std", "norm")}
+  if (model == "all") { model = list("sGARCH", "eGARCH", "iGARCH")}
+  model = as.list(model) %>% rep(each = length(distribution))
+  distribution = as.list(distribution) %>% rep(length(model)/length(distribution))
+  names = map2(model, distribution, .f = function(m,d){paste(tolower(m), d, "spec", sep = ".")})
+  # Generate Specifications
+  ls = list(model, distribution, names)
+  specs = pmap(ls, .f = function(m, dist, n){
+    spec = ugarchspec(variance.model = list(model = m, garchOrder = c(1, 1)),
+                      mean.model = list(armaOrder = c(0, 0)),
+                      distribution.model = dist)
+    assign(n, spec)
+    return(get(n))
+  })
+  names(specs) = names
+  return(specs)
+}
+
+# Fit to find the lastest garch volatility value and forecast to find the next garch volatility value
+# @param spec {S4} the garch model to be fitted on 
+# @param return {xts/zoo} the log return, untrimmed (the first value should be NA)
+# @return {numeric} the garch model parameters, fit and prediction 
+garch_fit <- function(spec, return) {
+  return = return[-1] # Remove the first row with NA value
+  model_fit = ugarchfit(spec, return, solver = "hybrid")
+  garch_coef = coef(model_fit) # Garch Model Parameters
+  garch_coef = garch_coef[names(garch_coef) != "mu"]
+  garch_coef = garch_coef[names(garch_coef) != "shape"]
+  
+  garch_fit_vol = last(sigma(model_fit)) * sqrt(252) * 100 # The Fitted Garch Volatility for Last Day in Data
+  
+  model_forecast = ugarchforecast(model_fit, n.head = 1)
+  garch_pred_vol = head(sigma(model_forecast), 1) * sqrt(252) * 100 # The Predicted Garch Volatility for the Next Day
+  
+  # print(return %>% index %>% last())  # Uncomment to check progress
+  model_info = c(garch_coef, fit =  garch_fit_vol,  pred = garch_pred_vol) %>% t() %>% as.data.frame()
+  return(model_info)
+}
+
+# Compute multiple garch model for multiple  option data at once
+# @param ls.df {list of dataframes} where each dataframe has xts/zoo column log_return
+# @param ls.spec {named list of S4} where each S4 element is a garch model specification
+# @return {list} with same length as ls.df, for each dataframe, fitted and predicted garch model specified in ls.spec
+ls_garch_fit <- function(ls.df, ls.spec) {
+  ls_fit <-  lapply(ls.df, function(df) {
+    vals = lapply(ls.spec, function(spec) {
+      # Start Fitting From the 101th day, as lower than 100 data points produces warning
+      n = nrow(df)
+      if(n < 101){message("Cannot fit GARCH model as it has length smaller than 101 observations"); stop()}
+      
+      ref = seq.int(101, nrow(df)) %>% as.list()
+      spec_fit = lapply(ref, function(t) {
+        garch_fit(spec, df$log_return[1:t])
+      }) %>% rbindlist()
+      return(spec_fit)
+    })
+    names(vals) = gsub(".{5}$", "", names(vals))
+    return(list.cbind(vals))
+  })
+  return(ls_fit)
+}
+
+# Compute multiple garch model for multiple option data (only the updated ones)
+# @param ls.df {list of dataframes} where each dataframe has xts/zoo column log_return
+# @param ls.spec {named list of S4} where each S4 element is a garch model specification
+# @return {list} with same length as ls.df, for each dataframe, fitted and predicted garch model specified in ls.spec
+ls_update_fit <- function(ls.df, ls.spec, ls.start) {
+  ls_update <- map2(ls.df, ls.start, .f = function(df, start){
+    vals <- lapply(ls.spec, function(spec){
+      ref = seq.int(start, nrow(df)) %>% as.list()
+      spec_fit <- lapply(ref, function(t){
+        garch_fit(spec, df$log_return[1:t]) 
+      }) %>% rbindlist()
+      return(spec_fit)
+    })
+    names(vals) = gsub(".{5}$", "", names(vals))
+    return(list.cbind(vals))
+  })
+  return(ls_update)
+}
+
+
+# ———————————————— Garch Model Update _______________________
+
+# Compute the garch informations for those that needed to be computed
+# @param curr_garch {named list} of dataframes with current garch model info  
+# @return {named list} of dataframes with the updated garch model info; also with date and close value appended to the front
+compute_new_garch <- function(curr_garch) {
+  close <- import_close(type = names(curr_garch), version = "update")
+  
+  # Find the un_calculated days
+  last_days <- extract_last_day(curr_garch)
+  start = map2(last_days, close, .f = function(last, close){
+    index = which(last %>% as.character() == close$Date %>% as.character())
+    return(index)
+  })
+  
+  # Start calculate new garch_info
+  specs <- generate_spec()
+  new_garch <- ls_update_fit(close, specs, start)
+  
+  # Append Date and close
+  close <- map2(close, start, .f = function(cl, st) {
+    cl = cl[(st:nrow(cl)),]
+    return(cl)
+  })
+  new_garch <- map2(close, new_garch, .f = function(cl, new){
+    new$Date = cl$Date; new$close = cl$close
+    new = new %>% relocate(Date, close, .before = 1)
+    return(new)
+  })
+  return(new_garch)
+}
+
+# Combine the previous garch data with the newly calculated data
+# @param curr_garch {named list} of dataframes with current garch model info  
+# @param new_garch {named list} of dataframes with the updated garch model info; also with date and close value appended to the front
+# @return {dataframe} with columns Date, Code (510050.SH, 510300.SH), colse, and garch model related values, formatting "{model}.{dist}.{parameter/fit/pred}"
+combine_update <- function(curr_garch, new_garch) {
+  # Combine list of datafram to produce one single dataframe
+  names(new_garch) <- paste(names(new_garch), ".SH", sep = "")
+  new_garch = new_garch %>% rbindlist(use.names = TRUE, idcol = TRUE) %>% arrange(Date)
+  new_garch = rename(new_garch, Code = .id) %>% relocate(Code, .after = Date)
+  new_garch$Date <- as.Date(new_garch$Date)
+  
+  # Combine newly calucluated data and existing data to get one new data
+  combined = rbindlist(curr_garch, use.names = TRUE) 
+  combined = rbind(combined, new_garch) %>% arrange(Date)
+  return(combined)
+}
+
+# Extract the last date for which garch model computation covers
+# @param curr_garch {named list} of dataframes with current garch model info  
+# @return {named list} of Date for each model 
+extract_last_day <- function(curr_garch) {
+  # Extract the last_day from garch
+  last_days <- lapply(curr_garch, function(df){
+    df <- df %>% arrange(Date)
+    last_day = df$Date[nrow(df)]
+    return(last_day)
+  })
+  return(last_days)
+}
+
+# Update the etf_garch data table on the sql server. Server infor is stored in the function connect
+# @param df {dataframe} with columns Date, Code (510050.SH, 510300.SH), colse, and garch model related values, formatting "{model}.{dist}.{parameter/fit/pred}"
+update_db <- function(df) {
+  # Drop table if it already exists
+  con = connect()
+  if (dbExistsTable(con, "etf_garch"))
+    dbRemoveTable(con, "etf_garch")
+  
+  # Write the data frame to the database
+  dbWriteTable(con, name = "etf_garch", value = df, row.names = FALSE)
+}
+
+
+```
+
+# Main
+```{r message=FALSE, warning=FALSE}
+# Compute Garch, eGarch, iGarch Data
+computed = compute_garch(model = "all", distribution = "all", type = "all")
+```
+
+```{r Update, message=FALSE, warning=FALSE}
+#update garch
+update_garch()
+```
+
+

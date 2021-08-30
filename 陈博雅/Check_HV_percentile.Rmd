@@ -1,0 +1,76 @@
+---
+title: "Check HV Percentile"
+---
+
+```{r Setup, message=FALSE, warning=FALSE}
+connect <- function() {
+  con <- DBI::dbConnect(odbc::odbc(), Driver = "ODBC Driver 17 for SQL Server", 
+    Server = "192.168.9.85", Database = "Option", UID = "sa", 
+    PWD = "lhtzb.123", Port = 1433)
+  return(con)
+}
+
+library(dplyr)
+library(rlist)
+```
+
+```{r}
+hv <-  tbl(connect(), "HV") %>% as.data.frame()
+hv_perc <- tbl(connect(), "HV_percentile") %>% as.data.frame()
+```
+
+```{r}
+# Split by Code
+hv_perc <-  hv_perc %>% split(f = as.factor(hv_perc$Code))
+# Split by Percentile Category
+split = Split_by_percent(hv_perc)
+
+
+```
+
+```{r}
+hv20 = split[["000016.SH"]][["HV5"]] %>% arrange(Date)
+
+ref = seq.int(1:nrow(hv20)) %>% as.list()
+test_hv20 <- lapply(ref, function(t){
+  target <- hv20$HV5[1:t]
+  drop = quantile(target, c(0.05, 0.95), na.rm = TRUE)
+  target1 = target[(target > drop[1]) & (target < drop[2])]
+  target = if(length(target1) -5 == 0) {target}else{target1} 
+  mi = min(target, na.rm = TRUE)
+  ma = max(target, na.rm = TRUE)
+  quant = quantile(target, c(0.1, 0.25, 0.5, 0.75), na.rm = TRUE)
+  compare = c(mi, quant, ma) %>% t() %>% as.data.frame()
+  names(compare) = c("min", "10", "25", "50", "75", "max")
+  return(compare)
+})
+test_hv20 = test_hv20 %>% list.rbind()
+
+check = data.frame(Date = hv20$Date, hv = hv20$HV5, h_75 = hv20$HV5_75, c_75 = test_hv20$`75`) %>% mutate(dif = h_75 - c_75)
+check1 = check %>% filter(dif != 0)
+```
+
+
+```{r Functions}
+Split_by_percent <- function(hv_perc) {
+  splited <- hv_perc %>% lapply(function(df){
+    pre <- names(df)[3:32]
+    reg <- paste("^", pre, sep = "")
+    separated <- lapply(reg, function(t){
+    single_df <- df %>% select(Date,matches(t)) %>% arrange(Date)
+    })
+    names(separated) <- pre
+    return(separated)
+  })
+  # Get Rid of ghost in HV 
+  splited <- lapply(splited, function(t){
+    for (i in 1:5) {
+    t[[i]] <- t[[i]] %>% select(-contains("ghost"))
+    }
+    return(t)
+  })
+  return(splited)
+}
+
+```
+

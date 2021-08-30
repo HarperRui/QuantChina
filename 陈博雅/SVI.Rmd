@@ -1,0 +1,940 @@
+---
+title: "SVI calibration"
+---
+
+
+```{r Setup, message=FALSE, warning=FALSE}
+library(plotly)
+library(arrow)
+library(data.table)
+library(fOptions)
+library(tidyr)
+library(Deriv)
+library(nloptr)
+library(purrr)
+library(ggplot2)
+library(ggpubr)
+library(rootSolve)
+library(dplyr)
+# source("SVI_func.R")
+# source("svi_h.R")
+```
+
+## 需要手动输入的
+```{r 需要手动输入的信息}
+# # 50
+read_path = "/Users/cindy/Desktop/Intern/Data/202104PRim"
+wtPath = "/Users/cindy/Desktop/Intern/Data/SVI_calib/etf50/"
+# stock index 300
+# read_path = "/Users/cindy/Desktop/Intern/Data/index300"
+# wtPath = "/Users/cindy/Desktop/Intern/Data/SVI_calib/"
+# 300
+# read_path = "/Users/cindy/Desktop/Intern/Data/etf300"
+# wtPath = "/Users/cindy/Desktop/Intern/Data/SVI_calib/etf300/"
+etftype = "5100500"
+
+case = ifelse(etftype == "000300", "index", "etf")
+# 勿改, sql用
+shIze = paste(etftype %>% as.character(), ".SH", sep ="")
+```
+
+## Setup
+```{r}
+library(DBI)
+con <- DBI::dbConnect(odbc::odbc(), Driver = "ODBC Driver 17 for SQL Server", 
+    Server = "192.168.9.85", Database = "Option", UID = "sa", 
+    PWD = "lhtzb.123", Port = 1433)
+
+```
+
+
+```{r Data Risk import}
+## Read Risk Data
+rf = dbReadTable(con, Id(schema = "dbo", name = "rf"))
+colnames(rf) = c("date", "risk")
+rf$date = as.Date(rf$date, format = "%Y-%m-%d")
+rf$risk = log( 1 + (rf$risk / 100))
+```
+
+```{sql Contract Info, connection = con, output.var = cdi}
+select "日期", "期权代码","交易代码","行权价","前结算价","收盘价","结算价","认购认沽","上市日","到期日"
+from contract_info_daily
+where "期权标的" = ?shIze
+```
+```{r cdi Processing}
+colnames(cdi) = c("date", "symbol", "trading_code", "strike_prc", "prev_setl_prc", "close",
+                  "setl.prc","callput", "effective_date", "expire_date")
+cdi = cdi %>%  
+  mutate(callput = ifelse(callput == "认购", "c", "p"))
+
+```
+
+
+```{sql Contract Info, connection = con, output.var = cdi_index}
+select "期权代码","行权价","上市日", "到期日"
+from contract_info_300index
+```
+```{r cdi_index Processing}
+colnames(cdi_index) = c("trading_code", "strike_prc", "effective_date", "expire_date")
+```
+```{sql 300index Daily, connection = con, output.var = daily_300}
+select "日期","期权代码","前结算价"
+from 日行情_300index
+```
+```{r 300index Daily}
+colnames(daily_300) = c("date", "trading_code", "prev_setl_prc")
+```
+
+## Functions
+```{r}
+# @param read_path {character} the path to read the data. [do not require a "/" at the end]
+# @param etf_type {character} the type of the data [one of "510050", "510300", "000300"]
+# @param case {character} indicating if the input data type [one of "etf" or "index"]
+# @param wtPath {character} the path to write the data on [require a "/" at the end]
+SVI_one_day <- function(read_path, etftype, case, wtPath) {
+  if(case == "etf") {
+    od = readOne(read_path)
+    od_stk = readStkPrc(read_path, type = etftype)
+    od = PrepareDf(od, cdi)
+    od = od %>% ChangeProbAB() %>% FillPrice() %>% ProcessOd()
+    od = MergeStkPrc(od, od_stk)
+    R = FindR(od)
+    od = CalcSigma(od, core = 2, R = R)
+    SVI_calibration_1day(od, wtPath, R = R)
+  } else {
+    od = readOne(read_path, "index")
+    od_stk = readStkPrc(read_path, type = etftype)
+    od = PrepareDf(od, od_stk, case = "index") %>% FillPrice()
+    od = ProcessOd(od, case = "index")
+    od = MergeStkPrc(od, od_stk)
+    R = FindR(od)
+    od = CalcSigma(od, core = 2, R = R)
+    SVI_calibration_1day(od, wtPath, case = "index", R = R)
+  }
+}
+
+
+
+# Calibrate SVI model for one day of data
+# Note: this day's interest rate R must already been loaded to the environment
+# @param df {dataframe} with columns: datetime, expire_mins, trading_code, stock_prc, strike_prc, sigma
+# @param wtPath {character scalar} the path to write the calibrated data on: usually end with "~/"
+# @param case {character scalar} the input data type, either "etf" or "index". [default = "etf"]
+# @param R {numeric scalar} the Annual continuously-compounded risk-free rate
+SVI_calibration_1day <- function(df, wtPath, case = "etf", R) {
+  # Compute Forward Price
+  # Transform to get the total implied variance = T* simga^2 _bs
+  # Transform to get log forward moneyness / log strike = log(K/F_T)
+  od1 = df %>% group_by(datetime, expire_mins) %>%
+    mutate(forward = stock_prc * exp(- R * expire_mins),
+           w_total = expire_mins * (sigma^2),
+           log_strike = log(strike_prc/forward)) %>% ungroup()
+  
+  # Get the minimum mkt total variance value; i.e. the initial guess for a
+  # Also get the maximum mkt total variance value; i.e. the upper bound for a
+  # Get the Min / Max for log strike; i.e. used as boundaries for m
+  extrmes = od1 %>% select(datetime, expire_mins, w_total, log_strike) %>% 
+    group_by(datetime, expire_mins) %>% summarise(W_min = min(w_total), W_max = max(w_total), 
+                                                  log_strk_min = min(log_strike), 
+                                                  log_strk_max = max(log_strike),
+                                                  .groups = "keep")
+  if(case == "etf"){od1 = od1 %>% mutate(trading_code = substr(trading_code,1,4))}
+  df = od1 %>% group_by(datetime, expire_mins, trading_code)
+  # df = rbind(df %>% subset(df$datetime == unique(df$datetime)[1]), df %>% subset(df$datetime == unique(df$datetime)[2]))  # TODO comment out
+  df1 = merge(df, extrmes) %>% group_by(datetime, expire_mins,trading_code) %>% nest()
+  df1[[4]] = lapply(df1[[4]], Pre_Smile_Process)
+  
+  # Calibrate SVI Parameters
+  params = map2(df1[[1]],df1[[4]], Get_SVI_Param)
+  ls = list(df1[[4]], params, df1[[2]])
+  params = pmap(ls, .f = JW_optmization)
+  
+  # Putting SVI Parameters and Datetime data together
+  index300_calibrated = df1 %>% transmute(datetime = datetime, expire_mins = expire_mins,
+                                          trading_code = trading_code) %>% ungroup()
+  temp = lapply(params, function(t){t %>% as.matrix() %>% t() %>% as.data.frame()}) %>%
+    rbindlist(use.names = TRUE)
+  index300_calibrated = cbind(index300_calibrated, temp)
+  names(index300_calibrated) = c("datetime", "expire_mins", "trading_code", "a", "b", "rho", "m", "sigma")
+  index300_calibrated = index300_calibrated %>% 
+    pivot_wider(id_cols = datetime, names_from = c(trading_code), names_glue = "{.value}_{trading_code}",
+                values_from = c(a,b,rho,m,sigma))
+  # Rename the dataframe to match the style
+  code = unique(df1$trading_code); code_b = c("a","b","rho","m","sigma")
+  oder = expand.grid(code_b, code) %>% mutate(name = paste(Var1,"_" ,Var2, sep = "")) %>% 
+    pull(3) %>% as.vector()
+  index300_calibrated = index300_calibrated[c("datetime", oder)]
+  # Prepare to write the output
+  dat = gsub("-","", index300_calibrated$datetime[1] %>% as.character() %>% substr(1,10))
+  path = paste(wtPath, dat,".csv", sep = "")
+  write.csv(index300_calibrated, path)
+  print(paste(dat, "Finished"))
+}
+
+
+## ______________ Read Data ______________ 
+
+# Read Minbar Data，一天整天的数据合并为一个dataframe
+# @param path {character} path to the data, we want to import, assume data is minbar data from datahouse
+# @param case {character scalar} the input data type, either "etf" or "index". [default = "etf"]
+# @return: {dataframe} dataframe with selected data -- see col_select
+readOne = function(path, case = "etf"){
+  if(case == "etf"){
+    od = list.files(path, recursive = TRUE,full.names = TRUE, pattern = "^sh_1000") %>%
+      lapply(function(f)
+        read_parquet(f, col_select = c("symbol","datetime", "close", "volume",
+                                       "first_ask_prc1", "first_ask_vol1", "first_ask_vol2",
+                                       "first_ask_vol3", "first_ask_vol4", "first_ask_vol5",
+                                       "first_bid_prc1", "first_bid_vol1", "first_bid_vol2",
+                                       "first_bid_vol3", "first_bid_vol4", "first_bid_vol5"))) %>%
+      rbindlist(use.names = TRUE) %>%
+      arrange(datetime) %>% 
+      mutate(symbol = as.numeric(substr(symbol, 1, 8)))
+  } else {
+    od = list.files(path, recursive = TRUE, full.names = TRUE, pattern = "^cfe_io")%>%
+      lapply(function(f)
+        read_parquet(f, col_select = c("symbol", "datetime", "open", "close", "volume",
+                                       "first_ask_prc1", "first_bid_prc1"))) %>%
+      rbindlist(use.names = TRUE) %>%
+      arrange(datetime) %>%
+      mutate(callput = symbol %>% substr(8,8) %>% tolower(),
+             symbol = substr(symbol, 1, 13))
+    }
+  return(od)
+}
+
+# 读取 etf50的分钟价格
+# @param Path {character scalar} path to the folder that contain the minbar stock price file 
+#       file name start with either "sh_510050" or "sh_510300" or "sh_000300"
+# @param type {character scalar} either "510050" or "510300" or "000300"
+# @return: {dataframe} with columns datetime, stock_prc
+readStkPrc = function(path, type){
+  pat = paste("^sh_", type, sep = "")
+  path = list.files(path, recursive = TRUE, full.names = TRUE, pattern = pat)
+  df = read_parquet(path, col_select = c("datetime", "open"))
+  colnames(df) = c("datetime", "stock_prc")
+  return(df)
+}
+
+
+
+## ______________ Pre-Calculation Process ______________ 
+
+# Combine Minbar Data & contract daily info to extract and process
+# relavent info such as strike price, expire_mins etc
+# @param od {dataframe} usually an output of readOne(). 
+#           Merge with cdi on columns "date" and "symbol" on case "etf"; "symbol" on case "index"
+# @param cdi {dataframe} daily contract info pulled from sql database.
+#           Merge with od on columns "date" and "symbol" on case "etf"; "trading_code" on case "index"
+# @param case {character scalar} either "etf" or "index" [default = "etf"]
+# @return {dataframe} with merged data, and expired_mins calculated
+PrepareDf = function(od, cdi, case = "etf"){
+  if(case == "etf"){
+    od$datetime = as.POSIXct(od$datetime, tz = "UTC")
+    cdiOD = cdi %>%  subset(as.Date(cdi$date) %in% unique(as.Date(od$datetime)))
+    
+    od = od %>% mutate(date = as.Date(datetime))
+    cdiOD$date =  as.Date(cdiOD$date)
+    
+    test = merge(od, cdiOD, by= c("date","symbol")) %>% rowwise() %>% 
+      mutate(close.x = ifelse(is.na(close.x), prev_setl_prc, close.x)) %>% 
+      group_by(symbol) %>%
+      mutate(pre_close_prc = c(head(prev_setl_prc,1), head(close.x, -1))) %>% ungroup() %>% 
+      select(-c(date, close.x, prev_setl_prc)) %>% 
+      arrange(datetime) %>% 
+      dplyr::filter(!is.na(trading_code)) %>% 
+      mutate(trading_code = substr(trading_code, 8, 17)) %>% 
+      mutate(expire_mins = difftime(expire_date, datetime, units = "mins")) %>% 
+      select(-c(effective_date, expire_date))
+      
+    test$expire_mins = test$expire_mins %>% as.numeric()
+  } else {
+    test = merge(od, cdi_index, by.x = "symbol", by.y ="trading_code",
+                 all.x = TRUE, all.y = FALSE) %>% 
+      mutate(trading_code = substr(symbol, 3, 6)) %>% 
+      mutate(expire_mins = difftime(expire_date, datetime, units = "mins"),
+             first_ask_prc1 = ifelse(is.na(first_ask_prc1), 0, first_ask_prc1),
+             first_bid_prc1 = ifelse(is.na(first_bid_prc1), 0, first_bid_prc1)) %>% 
+      select(-c(effective_date, expire_date)) %>% 
+      relocate(trading_code, .before = close)
+    
+    od1 = test
+    daily_300$date = daily_300$date %>% as.character()
+    od1$date = od1$datetime %>% as.character() %>% substr(1,10)
+    
+    od1 = merge(od1, daily_300, by.x = c("date", "symbol"), by.y = c("date", "trading_code"),
+                all.x = TRUE, all.y = FALSE) %>% select(-date) %>% group_by(symbol) %>% nest()
+    
+    od1[[2]] = lapply(od1[[2]], function(t){
+      pre_close_prc = c(t$prev_setl_prc[1], t$close[2:239])
+      t = cbind(t, pre_close_prc)
+    })
+    test = unnest(od1) %>% select(-c(prev_setl_prc, open, close))
+    
+    
+    test$expire_mins = test$expire_mins %>% as.numeric()
+  }
+  return(test)
+}
+
+# Check if a single set of data is problematic
+# Helper of ChangeProbAB
+# @param prc1 {numeric scalar} price
+# @param v_i {numeric scalar} volume
+# @return: {boolen}
+IsProb = function(prc1, v1, v2, v3, v4, v5){
+  cond1 = ((v2 + v3 + v4 + v5) > 0)
+  cond2 = (v1 == 0)
+  condN1 = cond1 & cond2
+  
+  cond1 = ((v1 + v2 + v3 + v4 + v5) == 0)
+  cond2 = (prc1 != 0) 
+  condN2 = cond1 & cond2
+  return(condN1 | condN2)
+}
+
+# Change Problematic data in the datafram -- replace price to 0
+# @param df {dataframe} must contain columns: first_ask_prc1, first_bid_prc1, first_ask_vol 1 ~ 5, first_bid_vol 1 ~ 5
+# @return {dataframe} chenge problem ask/bid price to 0
+ChangeProbAB = function(df){
+  ot1 = df %>% mutate(first_ask_prc1 = ifelse(IsProb(first_ask_prc1, first_ask_vol1, 
+                                                     first_ask_vol2, first_ask_vol3, 
+                                                     first_ask_vol4, first_ask_vol5),
+                                              0, first_ask_prc1),
+                      first_bid_prc1 = ifelse(IsProb(first_bid_prc1, first_bid_vol1, 
+                                                     first_bid_vol2, first_bid_vol3, 
+                                                     first_bid_vol4, first_bid_vol5), 
+                                              0, first_bid_prc1))
+  return(ot1)
+}
+
+# Helper of FillPrice
+# Fill in the price for 无成交合约
+# @param df {dataframe} subset of input df in FillPrice -- see specification for FillPrice
+# @return {dataframe} fill in the price following the rules in "上证50 ETF 波动率指数编制方案" with modification to transform unit to minute
+FillNosold = function(df){
+  test1 = df %>% arrange(volume)
+  nsubset = length(test1$volume[test1$volume == 0])
+  nosold = test1[1:nsubset,] %>% 
+    mutate(mid_prc = ifelse(first_bid_prc1 == 0, 
+                            ifelse(first_ask_prc1 == 0, pre_close_prc, 
+                                   min(first_ask_prc1, pre_close_prc)),
+                            ifelse(first_ask_prc1 == 0, max(pre_close_prc, first_bid_prc1), 
+                                   (first_ask_prc1 + first_bid_prc1)/2)))
+  return(nosold)
+}
+
+# Helper of Fillsold
+# Check x 是否在 rb1 与 rb2 之间
+# @param x {numeric scalar} the target value 
+# @param rb1, rb2 {numeric scalar} the lower and upper bound
+# @return: {boolean} 
+checkRange = function(x, rb1, rb2){
+  return(( (rb1 <= x) &  (x <= rb2)) | ( (rb2 <= x) & (x <= rb1)) )
+}
+
+# Helper of FillPrice
+# Fill in the price for 成交合约
+# @param df {dataframe} subset of input df in FillPrice -- see specification for FillPrice
+# @return {dataframe} fill in the price following the rules in "上证50 ETF 波动率指数编制方案" with modification to transform unit to minute
+Fillsold = function(df){
+  test1 = df %>% arrange(volume)
+  nsubset = length(test1$volume[test1$volume == 0])
+  sold = test1[(nsubset+1):nrow(test1),] %>% 
+    mutate(mid_prc = ifelse(first_bid_prc1 == 0, 
+                            ifelse(first_ask_prc1 == 0, pre_close_prc, 
+                                   min(first_ask_prc1, pre_close_prc)),
+                            ifelse(first_ask_prc1 == 0, max(pre_close_prc, first_bid_prc1), 
+                                   ifelse(checkRange(pre_close_prc, first_bid_prc1, first_ask_prc1),
+                                          pre_close_prc, 
+                                          (first_bid_prc1 + first_ask_prc1)/2))))
+  return(sold)
+}
+
+# Fill in the price for 合约
+# @param df {dataframe} usually the returned df for changeProbAB(),
+# @return {dataframe} fill in the price following the rules in "上证50 ETF 波动率指数编制方案" with modification to transform unit to minute
+FillPrice = function(df){
+  nosold = FillNosold(df)
+  sold = Fillsold(df)
+  od = rbind(nosold,sold)
+  return(od) 
+}
+
+# 简单处理一下 df, 筛去不参与计算的数据
+# @param df {dataframe} must contain columns: datetime, trading_code, callput, strike_prc, mid_prc, expire_mins, symbol
+# @param case {character} either "etf" or "index" [default = "etf"]
+# @return {dataframe} with columns: datetime, trading_code, strike_prc, callput, mid_prc, expire_mins
+# Note: new columns -- exipre_mins {numeric} 距离到期日期时间，单位为年
+ProcessOd = function(df, case = "etf"){
+  if(case == "etf"){
+    od = df %>% select(datetime, trading_code, callput, strike_prc, mid_prc, expire_mins, symbol)
+    
+    od = od %>% group_by(trading_code, datetime) %>% 
+      arrange(datetime) %>% 
+      mutate(expire_mins = expire_mins / (24*60*365))  %>% ungroup() %>% 
+      arrange(datetime, trading_code, callput)
+  } else {
+    od = df %>% mutate(expire_mins = expire_mins / (60*24*365)) %>% 
+      select(symbol, datetime, trading_code, strike_prc, mid_prc, callput, expire_mins)
+  }
+  return(od)
+}
+
+# Merge processed mibar data with minute etf price
+# @param df {dataframe} must contain column datetime, format "yyyy-MM-dd hh:mm:ss" and
+#                             column trading_code
+# @param df_stk {dataframe} must contain column datetime, format "yyyy-MM-dd hh:mm:ss" and 
+#                                 column stock_prc, the minute stock price
+# @return {dataframe} with column datetime, trading_code, stock_prc, etc
+MergeStkPrc <- function(df, df_stk) {
+  df$datetime = df$datetime %>% as.character()
+  df_stk$datetime = df_stk$datetime %>% as.character()
+  od1 = merge(df, df_stk, by.x = "datetime", by.y = "datetime") %>% 
+    relocate(stock_prc, .after = trading_code)
+    return(od1)
+}
+
+
+# Reformat and drop unecessary market iv & total variance 
+# @param df {dataframe} with columns: stock_prc, strike_prc, log_strike, W_min, W_max, log_strk_min, log_strk_max, callput, sigma, w_tatal, symbol
+#           usually an output of Calc_Sigma()
+# @return {dataframe} that is half of the length (observations) of that of the input dataframe
+Pre_Smile_Process <- function(df) {
+  df = df %>% pivot_wider(id_cols = c(stock_prc, strike_prc, log_strike, W_min, W_max, log_strk_min, log_strk_max), 
+                          names_from = callput, names_glue = "{callput}_{.value}", values_from = c(sigma, w_total, symbol)) %>% 
+    mutate(isCall = strike_prc >= stock_prc,
+           sigma = ifelse(isCall, c_sigma, p_sigma),
+           w_total = ifelse(isCall, c_w_total, p_w_total)) %>% 
+    select(-isCall)
+  return(df)
+}
+
+
+
+## ______________ Calculation ______________ 
+
+
+# 寻找计算当天对应的国债利率, R 的处理在 rf 的读取后已经完成了
+# @param df {dataframe} must contain column datetime
+# @return {numeric scalar} 当天的国债利率
+FindR = function(df){
+  today = as.Date(df$datetime[1], format = "%Y-%m-%d")
+  R = subset(rf, rf$date == today)$risk
+  return(R)
+}
+
+# 计算delta的数值
+# @param df {dataframe} df must be an output of MergeStkPrc()
+# @param core {numeric} the number of core options taken into calculation [NOT USED in SVI Calibration]
+# @param R {numeric} the Annual continuously-compounded risk-free rate
+# @return {dataframe} the input dataframe with dividend yield (d & mu_d), implied vol(iv) and delta(delta) appended at the back
+CalcSigma <- function(df, core = 6, R) {
+  od1 = df %>% arrange(trading_code, callput) %>% 
+    pivot_wider(id_cols = c(datetime, trading_code, stock_prc, strike_prc, expire_mins), 
+                names_from = callput,
+                values_from = c(mid_prc, symbol), names_glue = "{callput}_{.value}") %>% 
+    arrange(datetime, trading_code) %>% 
+    group_by(datetime, expire_mins) %>% mutate(dif = abs(stock_prc - strike_prc)) %>% 
+    arrange(dif) %>% 
+    mutate(d = -log((c_mid_prc - p_mid_prc + (strike_prc * exp(-R *expire_mins))) / stock_prc) / expire_mins) %>% ungroup()
+  
+  od1_mud = od1 %>% group_by(datetime, expire_mins) %>% 
+    slice(1:(core))  %>% summarise(mu_d = mean(d), .groups = "keep")
+  
+  od2 = merge(od1, od1_mud, by = c("datetime", "expire_mins"), all.x = TRUE)
+  
+  od3 = od2 %>% select(-dif) %>% 
+    pivot_longer(cols = c(c_mid_prc, p_mid_prc, c_symbol, p_symbol), 
+                 names_to = c("callput", ".value"),
+                 names_pattern = "(.)_(.*)") %>% 
+    relocate(d, mu_d, .after = last_col()) %>% ungroup() %>% 
+    arrange(callput) 
+  
+  
+  od4 = od3 %>% rowwise() %>% mutate(sigma = GBSVolatility(mid_prc, callput, stock_prc, strike_prc, expire_mins, r = R,
+                                                           b = R - mu_d)) %>% arrange(symbol)
+  return(od4)
+}
+
+
+#  ______________ SVI Calibration Helper ______________ 
+
+# Calculate the y component of the SVI total variance function: w = a + dy + cz
+# @param x {numeric vector} the log moneyness
+# @param m,s {numeric scalar} parameters of SVI model
+# @return y = (x -m)/s
+Yx <- function(x, m, s) {return((x-m)/s)}
+
+# Calculate the z component of the SVI total variance funciton: w = a + dy + cz
+# @param Yx {numeric scalar} the out put of Yx function
+# @return z = sqrt(y^2 + 1)
+Zx <- function(Yx) {return(sqrt(Yx^2 + 1))}
+
+
+# The Nested Optimization Function used in SVI parameter calibration [OUTER OBJECTIVE]
+# @param adc0 {numeric(3)} the initial guesses for parameters adc [NOT USED: redefined as x0 inside the function]
+# @param ms {numeric(2)} the value for parameter m and s
+# @param x {numeric vector} the log Moneyness
+# @param wi {numeric vector} the market total variance
+# @param w_max {numeric scalar} the maximum total variance
+# @param envir {Envir} the parent environment to store the output of optimized adc params
+# @return the sum of squared error for the optimed adc and current version of parameter m and s
+outer_objective <- function(adc0, ms, x, wi, w_max, envir) {
+  m = ms[1]; s = ms[2]
+  yx = Yx(x, m, s)
+  zx = Zx(yx)
+  
+  # Mimization
+  inner_objective <- function(adc0, yx, zx, wi) {
+    a = adc0[1]; d = adc0[2]; c = adc0[3]
+    fitted = a + d*yx +c*zx
+    res = fitted - wi
+    sum(res^2)
+  }
+  
+  # hin_inner <- function(x) {
+  #   a = x[1]; d = x[2]; c = x[3]
+  #   h = numeric(6)
+  #   h[1] = c - 1e-10
+  #   h[2] = 4 *s - c
+  #   h[3] = c - abs(d)
+  #   h[4] = 4*s - c - abs(d)
+  #   h[5] = a - 1e-19
+  #   h[6] = w_max
+  #   return(h)
+  # }
+  # adc = slsqp(adc0, inner_objective, yx = yx, zx = zx, wi = wi, hin = hin_inner,
+  #             lower = c(1e-10, -4*s, 0), upper = c(w_max, 4*s, 4*s),
+  #             control = list(xtol_rel = 1e-8, check_derivatives = FALSE))
+  
+  ui = rbind(c(0,0,1), c(0,0,-1),
+             c(0,-1,1), c(0, 1, 1),
+             c(1, 0, 0), c(-1, 0, 0))
+  ci = c(0, -4*s, 0, 0, 0, -w_max)
+  x0 = c(w_max/2, -s, 2*s)
+  adc <- constrOptim(x0,inner_objective, yx = yx, zx = zx, wi = wi, grad = NULL, ui = ui, ci = ci)
+  
+  val = adc$value
+  adc = adc$par
+  a = adc[1]; d = adc[2]; c = adc[3]
+  b = c/s; rho = d/c
+  assign("param_star", c(a,b,rho,val), envir = envir)
+
+  fitted = a + d*yx + c*zx
+  res = fitted - wi
+  sum(res^2)
+}
+
+# Calibrate the SVI parameters {a,d,c,m,sigma} input data
+# @param tau {numeric scalar} [NOT USED in Calculaton] only used in debug model. THe datetime of current iteration
+# @param df {datafram} with columns W_min, W_max, log_strk_min, log_strk_max, log_strike, w_total
+# @return {numeric(5)} the calibrated parameters (a,d,c,m,sigma)
+# Note that there are two ways in calibrate parameter m and sigma below. Here we use neldermead as it is quicker 
+Get_SVI_Param <- function(tau, df) {
+  # Setup the initial guesses
+  x0 = c(df$W_min[1], 0.01, -0.3, 0.01, 0.01) 
+  adc0 = c(x0[1], x0[3]*x0[2]*x0[5], x0[2]*x0[5])
+  ms0 = c(x0[4], x0[5])
+  # Setup Upper and Lower Bound for m and sigma
+  lwd = c(df$log_strk_min[1], 10^-8)
+  upd = c(df$log_strk_max[1], 10)
+  # Initiate new param_star
+  param_star = numeric(4)
+  envir = environment()
+  ms = nloptr::neldermead(x0 = ms0, outer_objective, adc0 = adc0, x = df$log_strike, wi = df$w_total,
+                          w_max = df$W_max[1], envir = envir, lower = lwd, upper = upd,
+                          control = list(xtol_rel = 1e-8))
+  
+  # ui = rbind(c(1,0), c(-1,0), c(0, 1), c(0, -1))
+  # ci = c(df$log_strk_min[1], -df$log_strk_max[1], 10e-8, -10)
+  # ms = constrOptim(theta = ms0, f = outer_objective, adc0 = adc0, x = df$log_strike, wi = df$w_total, 
+  #                  w_max = df$W_max[1], envir = envir, method = "Nelder-Mead", grad = NULL, ui = ui, ci = ci)
+  ms = ms$par
+  adc = param_star[1:3]
+  svi_param = c(adc, ms)
+  names(svi_param) = c("a", "b", "r", "m", "s")
+  # print(tau)  # Print SVI parameters
+  return(svi_param)
+}
+
+# Compute Total Variance & Implied volatility & density with given time to maturity tau and SVI parameters
+# @param tau {numeric scalar} the time to expiration in minutes
+# @param svi_param {numeric(5)} the SVI model parameters {a,d,c,m,sigma} ---> w = a + dy + cz
+# @param df {dataframe} with column log_strike, i.e. log_moneyness
+# @param case {character scalar} either "adc" or "raw"; used to distinguish different types of svi parameters.  [default = "adc"]
+# @return df {dataframe} the input dataframe with total variance [w_svi], implied volatility [svi_sig], and density [dens] appended to the back 
+Compute_SVI_ivs <- function(tau, svi_param, df, case = "adc") {
+  if(case == "adc"){
+    w_svi =  svi_param[1] + svi_param[2] * Yx(df$log_strike, svi_param[4], svi_param[5]) +
+      svi_param[3]*Zx(Yx(df$log_strike, svi_param[4], svi_param[5])) 
+    dens = Get_adc_density(df$log_strike, svi_param)
+  } else {
+    a = svi_param[1]; b = svi_param[2]; r = svi_param[3]; m = svi_param[4]; s = svi_param[5]
+    w_svi = a + b*(r*(df$log_strike - m) + sqrt((df$log_strike - m)^2 + s^2))
+    dens = Get_density(df$log_strike, svi_param)
+  }
+  vol = sqrt(w_svi/tau)
+  
+  df$svi_sig = vol
+  df$w_svi = w_svi
+  df$dens = dens
+  return(df)
+}
+
+# Function to solve JW parameters back to raw SVI parameters
+# @param jw_paramT {numeric(6)} jw parameters and the time to expirary in mins {vt, psit, pt, ct, vhatt, texp}
+# @return {numeric(5)} raw SVI parameters {a,b,r,m,s}
+JW_to_SVI <- function(jw_paramT) {
+  vt = jw_paramT[1]; psit = jw_paramT[2]; pt = jw_paramT[3]; ct = jw_paramT[4]; vhatt = jw_paramT[5];
+  texp = jw_paramT[6]
+  
+  wt = vt * texp
+  
+  b = sqrt(wt)/2 * (ct + pt)
+  r = 1 - (pt*sqrt(wt)/b)
+  beta = r - (2*psit*sqrt(wt)/b)
+  alpha = sign(beta)*sqrt((1/(beta^2)) - 1)
+  m = ((vt - vhatt)*texp) / (b*(-r + sign(alpha)*sqrt(1+alpha^2)- alpha*sqrt(1-r^2)))
+  if(m == 0){s = (vt * texp - a)/b } else {s = alpha * m}
+  a = vhatt * texp -(b*s*sqrt(1-(r^2)))
+  if(s < 0){s = 0}
+  new_raw = c(a,b,r,m,s)
+  names(new_raw) = c("a", "b", "r","m","s")
+  return(new_raw)
+}
+
+# Re-calibrate the svi_raw parameter for SVI model if it has negative density
+# @param df {dataframe} with column log_strike
+# @param svi_param {numeric(5)} raw svi_parameters {a,b,r,m,s}
+# @param tau {numeric scalar} the time to expirary for corresponding to thw svi_param and df data
+# @return if the current svi model contains negative density, it will return the raw svi parameters after jump wing process. Otherwise, it will return the given svi_parameter
+JW_optmization <- function(df, svi_param, tau) {
+  density = Get_density(df$log_strike, svi_param)
+  if(!(all(density >= 0))){
+    svi_param = JW_recalibration(df, svi_param, tau)
+  }
+  return(svi_param)
+}
+
+
+#  ______________ SVI Plotter ______________ 
+
+# Function to plot Volatility Smile, Density Curve, and IV Residual 
+# @param df {dataframe} usually an output of Compute_SVI_ivs. Must contain columns strike_prc, log_strike, callput, sigma, svi_sig, dens
+# @param dateCode {character} the datetime and trading_code the current graph refers to 
+# @return {list(3)} A list of all three plots -- in the order of volatility smile, density curve and iv residual
+Plot_SVI <- function(df, dateCode) {
+  # df3 = df %>% pivot_wider(id_cols = c(strike_prc,stock_prc, log_strike), names_from = callput, 
+  #                          names_glue = "{callput}_{.value}", values_from = c(sigma, svi_sig, dens)) %>% 
+  #   mutate(IsCall =  strike_prc >= stock_prc,
+  #          mkt_iv = ifelse(IsCall, c_sigma, p_sigma),
+  #          svi_iv = ifelse(IsCall, c_svi_sig, p_svi_sig),
+  #          svi_dens = ifelse(IsCall, c_dens, p_dens)) %>% 
+  #   select(stock_prc, log_strike, mkt_iv, svi_iv, svi_dens)
+  
+  df3 = df %>% transmute(log_strike = log_strike, mkt_iv = sigma, svi_iv = svi_sig, svi_dens = dens)
+  
+  p_sm = Plot_SVI_Smile(df3, "smile", dateCode)
+  p_dens = Plot_SVI_Smile(df3, "density", dateCode)
+  p_res = Plot_SVI_Smile(df3, "residual", dateCode)
+  return(list(p_sm, p_dens, p_res))
+}  
+
+# Plot the residual plot for SVI implied volatility model
+# Fitted == SVI iv; Sample == Market iv
+# @param df {dataframe} with columns log_strike, mkt_iv, svi_iv
+# @return object that represent the residual plot
+Plot_SVI_Residual <- function(df){
+  res_plot = ggplot(df, aes(x = log_strike, y = mkt_iv - svi_iv)) +
+    geom_point() + 
+    labs(title = "SVI Volatility Residual Plot", x = "Log Moneyness", y = "Residual")
+  return(res_plot)
+}
+
+
+# Helper function o Plot_SVI
+# Plot SVI model related graphs
+# @param df {dataframe} with column log_strike, svi_iv, mkt_iv, svi_dens
+# @param case {character scalar} to decide which case of graphs to draw [default = "smile"]
+#             c("smile", "density", "residual") represent volatility smile graph, density curve graph, iv residual graph respectively
+# @param datetime {character} the datatime and trading code this graph refers to 
+# @return the plot object
+Plot_SVI_Smile <- function(df, case = "smile", dateCode) {
+  
+  smile = ggplot(data= df, aes(x=log_strike)) +
+    # geom_point(aes(y = svi_iv)) +
+    geom_smooth(aes(y = svi_iv, color = "red")) +
+    geom_point(aes(y = mkt_iv)) +
+    # geom_smooth(aes(y = mkt_iv, color = "blue")) +
+    labs(title = "Volatility Curve", x = "Log Moneyness", y = "Implied Volatility", caption = dateCode) +
+    theme(legend.position = "top") +
+    scale_color_identity(name = "iv_type", breaks = c("red", "blue", "light green"), 
+                         labels = c("SVI", "Market", "SVI Desity"),
+                         guide = "legend")
+  
+  dens = ggplot(data = df, aes(x=log_strike)) +
+    geom_point(aes(y = svi_dens)) +
+    geom_smooth(aes(y = svi_dens), colour = "light green")+
+    labs(title = "Density Curve", x = "Log Moneyness", y = "Density g(k)", caption = dateCode)
+  
+  res_plot = ggplot(df, aes(x = log_strike, y = mkt_iv - svi_iv)) +
+    geom_point() + 
+    labs(title = "SVI Volatility Residual Plot", x = "Log Moneyness", y = "Residual", caption = dateCode)
+  
+  switch (
+    case,
+    "smile" = return(smile),
+    "density" = return(dens),
+    "residual" = return(res_plot)
+  )
+}
+
+
+## ______________ SVI Density Function ______________ 
+
+# Get Density g(x) for raw SVI parmeters
+# @param log_strk {nuemric vecter} the log Moneyness
+# @param {numeric(5)} the raw SVI model parameters {a, b, rho, m, sigma}
+# @return {numeric vector} of density g(x)
+Get_density <- function(log_strk, param) {
+  a = param[1]; b = param[2]; r = param[3]; m = param[4]; s = param[5]
+  w_func <- function(log_strk){(a + b * (r* (log_strk - m) + sqrt((log_strk-m)^2 + s^2) ))}
+  
+  w_1st <- function(log_strk) {
+    .e1 <- log_strk - m
+    b * (.e1/sqrt(.e1^2 + s^2) + r)}
+  
+  w_2nd  <- function(log_strk) {
+    .e1 <- (log_strk - m)^2
+    .e2 <- .e1 + s^2
+    b * (1 - .e1/.e2)/sqrt(.e2)
+  }
+  
+  w_0 = w_func(log_strk); w_1 = w_1st(log_strk); w_2 = w_2nd(log_strk)
+  
+  g1 = (1 - (log_strk * w_1)/(2*w_0))^2
+  g2 = 0.25* w_1^2 * (1/w_0 + 0.25)
+  g3 = w_2/2
+  
+  g = g1 - g2 + g3
+  return(g)
+}
+
+# Get Density g(x) for SVI adc parameters
+# @param log_strk {nuemric vecter} the log Moneyness
+# @param {numeric(5)} the raw SVI model parameters {a, d, c, m, sigma}
+# @return {numeric vector} of density g(x)
+Get_adc_density <- function(log_strk, param) {
+  a = param[1]; d = param[2]; c = param[3]; m = param[4]; s = param[5]
+  w_func <- function(log_strk){(a + d *((log_strk - m)/s) + c*sqrt( (((log_strk - m)/s)^2) + 1) )}
+  
+  w_1st <- function(log_strk) {
+    d * (1/s) + c * (0.5 * (2 * (1/s * ((log_strk - m)/s)) * ((((log_strk - m)/s)^2) + 1)^-0.5))}
+
+  w_2nd  <- function(log_strk) {
+    c * (0.5 * (2 * (1/s * (1/s)) * ((((log_strk - m)/s)^2) + 1)^-0.5 + 
+                  2 * (1/s * ((log_strk - m)/s)) * (-0.5 * (2 * (1/s * ((log_strk - 
+                                                                           m)/s)) * ((((log_strk - m)/s)^2) + 1)^-1.5))))
+  }
+  
+  w_0 = w_func(log_strk); w_1 = w_1st(log_strk); w_2 = w_2nd(log_strk)
+  
+  g1 = (1 - (log_strk * w_1)/(2*w_0))^2
+  g2 = 0.25* w_1^2 * (1/w_0 + 0.25)
+  g3 = w_2/2
+  
+  g = g1 - g2 + g3
+  return(g)
+}
+
+## ______________ SVI Jump Wing ______________ 
+
+# Using Jump Wing, jw method to recalibrate the raw svi parameters 
+# Following Gatheral's 3 step method
+#     1. Calculate JW parameter from the original SVI_raw parameters. (i.e. obtained jw_parameter)
+#     2. Substitute the JW parameter ct and vhatt by replacement. (i.e. obtained jw_fixed parameter)
+#     3. Use jw_parameter and jw_fixed parameter as bounds to obtain the optimal value for c_t and vhat_t (i.e. jw_optimal parameter) then solve for raw parameters
+# @param df {dataframe} with columns log_strike
+# @param raw_param {numeric(5)} the SVI raw parameters {a,b,r,m,s}
+# @texp {numeric scalar} time to expirary corresponding to the svi_raw parameters
+# @return {numeric(5)} the new svi raw_parameter after jw calibration
+JW_recalibration <- function(df, raw_param, texp) {
+  x1 = JW_recalibration_p1(raw_param, texp)
+  x2 = JW_to_SVI(x1[2,] %>% unlist())
+  x3 = JW_recalibration_p2(df, x1[1,] %>% unlist(), x1[2,] %>% unlist())
+  return(x3)
+}
+
+
+# Helper no.1 of JW_recalibration()
+# Function to calculate the initial JW parameter directly from raw SVI parameters AND the fixed JW paramters with sumbstituted ct and vhatt
+# @param raw_param {numeric(5)} Raw_SVI parameters {a,b,r,m,s}
+# @param tau {numeric scalar} the time to expirary tau corresponding to the current raw_parameters
+# @return {dataframe} with first row as the jw parameters and the second row as the jw fixed parameters
+JW_recalibration_p1 <- function(raw_param, tau) {
+  raw_param = raw_param %>% unname()
+  a = raw_param[1]; b = raw_param[2]; r = raw_param[3]; m = raw_param[4]; s = raw_param[5]
+  
+  # jw parameters corresponding to raw SVI
+  vt = (a + b*(-r*m + sqrt(m^2 + s^2)))/tau
+  wt = vt * tau
+  psit = 1/sqrt(wt) * (b/2) * (r - (m/sqrt(m^2 + s^2)))
+  pt = 1/sqrt(wt) * b *(1-r)
+  ct = 1/sqrt(wt)* b * (1+r)
+  vhatt = 1/tau * (a + b*s*sqrt(1- r^2))
+  
+  # repick ct and vhatt
+  new_ct = pt + 2*psit
+  new_vhatt = vt * 4*pt*ct/((pt+ct)^2)
+  
+  jw_parameters = rbind(c(vt, psit, pt, ct, vhatt, tau), c(vt, psit, pt, new_ct, new_vhatt, tau)) %>% 
+    as.data.frame()
+  colnames(jw_parameters) = c("vt", "psit", "pt", "ct", "vhatt", "texp")
+  # print(jw_parameters)
+  return(jw_parameters)
+}
+
+
+
+# Helper no.2 for JW_recalibration()
+# Calibrate values of ct and phat p to make it as close to the real value as possible
+# @param df {dataframe} with column log_strike
+# @param jw {numeric(5+1)} the svi_jw parameters, either with or without the time to expirary tau;
+#         if contains tau, tau must be at the end; {a,b,r,m,s,tau}
+# @param jw_fiex {numeric(5+1)} the svi_jw parameter after ct and vhatt substitution with or without the time to expiorary tau
+#         if contains tau, tau must be at the end; {a,b,r,m,s,tau}
+# @return {numeric(5+1)} the sv_raw parmater obtain from svi_jw parmater at the optimal, with ot without the time to expirary tau
+#         if contains tau, tau must be at the end
+JW_recalibration_p2 <- function(df, jw, jw_fixed) {
+  
+  obj = function(par, jw_param){
+    ct = par[1]; vhatt = par[2]
+    
+    jw_param[4] = ct; jw_param[5] = vhatt
+    new_raw = JW_to_SVI(jw_param)
+    
+    a = new_raw[1]; b = new_raw[2]; r = new_raw[3]; m = new_raw[4]; s = new_raw[5]
+    fitted = a + b*(r*(df$log_strike - m) + sqrt((df$log_strike - m)^2 + s^2))
+    res = df$w_total - fitted
+    # dens = Get_density(df$log_strike, c(a,b,r,m,s))
+    sum(res)^2 # + sum(100*dens)^2
+  }
+  
+  c_upd = max(jw[4], jw_fixed[4])
+  c_lwd = min(jw[4], jw_fixed[4])
+  v_upd = max(jw[5], jw_fixed[5])
+  v_lwd = min(jw[5], jw_fixed[5])
+  
+  optCV = optim(par = c(jw[4], jw[5]), fn = obj, jw_param = jw, method = "L-BFGS-B", 
+                lower = c(c_lwd, v_lwd), upper = c(c_upd, v_upd))
+  
+  jw[4] = optCV$par[1]; jw[5] = optCV$par[2]
+  
+  JW_to_SVI(jw)
+}
+
+
+## ______________ Functions Not Used ______________ 
+
+# 
+# # ## JW transformation,
+# # # add an additional parameter at the end to store time to maturity texp
+# JW_tranform <- function(param, texp) {
+#   a = param[1]; b = param[2]; r = param[3]; m = param[4]; s = param[5]
+# 
+#   wt = (a + b*(-r*m + sqrt(m^2 + s^2)))
+# 
+#   vt = wt/texp
+#   psit = 1/sqrt(wt) * (b/2) * (r - (m/sqrt(m^2 + s^2)))
+#   pt = 1/sqrt(wt) * b * (1-r)
+#   ct = 1/sqrt(wt) * b * (1+r)
+#   vhat = (1/texp) * (a + b*s*sqrt(1-r^2))
+#   return(c(vt,psit,pt,ct,vhat, texp))
+# }
+# # 
+# # # Change Ct/Pt, vhat for JW free-of butterfly 
+# JW_substitution <- function(jw_param, type = "ct") {
+#   vt = jw_param[1]; psit = jw_param[2]; pt = jw_param[3]; ct = jw_param[4]; vhat = jw_param[5];
+#   texp = jw_param[6]
+# 
+#   if(type == "ct"){ct = pt + 2*psit}else{pt = ct - 2*psit}
+#   vhat = vt * 4* pt * ct/((pt + ct)^2)
+# 
+#   jw_param[3] = pt; jw_param[4] = ct; jw_param[5] = vhat
+#   return(jw_param)
+# }
+
+# # Check for free of butterfly arbitrage
+# Is_butterfly_free <- function(jw_param) {
+#   vt = jw_param[1]; psit = jw_param[2]; pt = jw_param[3]; ct = jw_param[4]; vhat = jw_param[5]; 
+#   texp = jw_param[6]
+#   
+#   cond1 = sqrt(vt * texp) * max(pt, ct) < 2
+#   cond2 = (pt + ct) * max(pt, ct) <= 2
+#   
+#   return(cond1 & cond2)
+# }
+# 
+# 
+# # Solve Optimized JW parameters to get SVI raw parameters
+# Solve_JW <- function(raw_param, jw_param) {
+#   vt = jw_param[1]; psit = jw_param[2]; pt = jw_param[3]; ct = jw_param[4]; vhat = jw_param[5];
+#   texp = jw_param[6]
+# 
+#   param = c(vt, psit, pt, ct, vhat)
+# 
+#   model <- function(x, param) {
+#     a = x[1]; b =x[2]; r = x[3]; m =  x[4]; s = x[5]
+#     c(F1 = (a + b*(-r*m + sqrt(m^2 + s^2)))/texp - param[1],
+#       F2 = 1/sqrt(param[1]*texp) * (b/2) * (r - (m/sqrt(m^2 + s^2))) -param[2],
+#       F3 = 1/sqrt(param[1]*texp) * b * (1-r) - param[3],
+#       F4 = 1/sqrt(param[1]*texp) * b * (1+r) - param[4],
+#       F5 = (1/texp) * (a + b*s*sqrt(1-r^2)) - param[5])
+#   }
+# 
+#   new_raw = multiroot(model, start = raw_param, param = param)
+#   new_raw
+# }
+# 
+# # Check if the transformed parameters a, d, c \in D
+# In_Domain <- function(a,d,c,s,w_max) {
+#   cond1 = (c >= 0) & (c <= 4*s)
+#   cond2 = abs(d) <= c
+#   cond3 = abs(d) <= (4*s - c)
+#   cond4 = (0 <= a) & (a <= w_max)
+#   return(cond1 & cond2 & cond3 & cond4)
+# }
+
+# ## param ng
+# Find_ng <- function(param) {
+#   r = param[3]; s = param[5]
+#   ng = sqrt(1-r)/s
+#   return(ng)
+# }
+# 
+# # Find SVI model volatility
+# # @param type {char} either "sigma" or "Total". 
+# #                   Sigma -- implied volatility; Total: implied total variance
+# #                   If not specified, use "sigma".
+# Get_SVI_sigma <- function(param, log_strk, texp, type = "sigma") {
+#   a = param[1]; b = param[2]; r = param[3]; m = param[4]; s = param[5]
+#   w_svi = a + b * (r* (log_strk - m) + sqrt((log_strk-m)^2 + s^2) )
+#   if(type == "Total"){return(w_svi)}
+#   sigm =  sqrt(w_svi / texp)
+#   return(sigm)
+# }
+
+```
+
+
+
+## Main
+```{r Main}
+om = list.files(read_path, recursive = FALSE, full.names = TRUE)
+lapply(om, SVI_one_day, etftype = etftype, case = case, wtPath = wtPath)
+
+## If only want to get One-Day data, use this
+# SVI_one_day(read_path = om[12], etftype = etftype, case = case, wtPath = wtPath)
+```
+
